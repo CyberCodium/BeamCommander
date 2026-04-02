@@ -1,9 +1,6 @@
 #!/bin/bash
-# ═══════════════════════════════════════════════════════════════════════════════
-# PowerBeam Advanced Management Script v2.0
-# For Ubiquiti PowerBeam M5 400 UX with OpenWRT
+# PowerBeam Advanced Management Script v1.0
 # Copyright © 2026 E.B.G - All Rights Reserved
-# ═══════════════════════════════════════════════════════════════════════════════
 
 set -o pipefail
 
@@ -12,7 +9,7 @@ INTERFACE="${INTERFACE:-eth0}"
 POWERBEAM_IP="${POWERBEAM_IP:-192.168.1.20}"
 ALT_IP="${ALT_IP:-192.168.1.1}"
 SSH_USER="${SSH_USER:-root}"
-SSH_KEY="${SSH_KEY:-}"
+SSH_KEY="$HOME/.ssh/powerbeam_key"
 TIMEOUT="${TIMEOUT:-10}"
 BACKUP_DIR="${BACKUP_DIR:-$HOME/powerbeam-backups}"
 LOG_FILE="${LOG_FILE:-/tmp/powerbeam-manager.log}"
@@ -20,7 +17,7 @@ SCAN_INTERFACE="${SCAN_INTERFACE:-wlan0}"
 
 # PowerBeam M5 400 specs
 PB_FREQ_BAND="5GHz"
-PB_MAX_TX=25         # dBm max for M5 400
+PB_MAX_TX=25
 PB_VALID_CHANNELS_20="36 40 44 48 52 56 60 64 100 104 108 112 116 120 124 128 132 136 140 149 153 157 161 165"
 PB_VALID_CHANNELS_40="36 40 44 48 52 56 60 64 100 104 108 112 116 120 124 128 132 136 140 149 153 157 161"
 PB_VALID_CHANNELS_80="36 40 44 48 52 56 60 64 100 104 108 112 116 120 124 128 149 153 157 161"
@@ -107,7 +104,6 @@ validate_int() {
 }
 
 sanitize_string() {
-    # Remove shell metacharacters for safe SSH usage
     echo "$1" | sed 's/[;&|`$(){}\\<>!'"'"'"]//g'
 }
 
@@ -132,59 +128,41 @@ validate_subnet() {
 
 # ─── CONNECTIVITY ─────────────────────────────────────────────────────────────
 
-# Detect the ethernet interface connected to the PowerBeam
 detect_interface() {
     local iface
-    # Look for active ethernet interfaces (not loopback, not wireless)
-    for iface in $(ip -o link show up 2>/dev/null | awk -F': ' '{print $2}' | grep -vE '^(lo|wl|ww|docker|br-|veth|virbr)'); do
-        # Check if it has an IP assigned
-        if ip addr show "$iface" 2>/dev/null | grep -q 'inet '; then
+    for iface in $(ls /sys/class/net/ 2>/dev/null | grep -E '^eth|en'); do
+        if ip link show "$iface" 2>/dev/null | grep -q 'state UP'; then
             echo "$iface"
             return 0
         fi
     done
+    
+    for iface in $(ls /sys/class/net/ 2>/dev/null | grep -E '^eth|en'); do
+        echo "$iface"
+        return 0
+    done
+    
     echo "eth0"
     return 1
 }
 
-# Get the local subnet for scanning
 get_local_subnet() {
     local iface="$1"
-    ip -4 addr show "$iface" 2>/dev/null | grep -oP 'inet \K[0-9./]+' | head -1
+    ip -4 addr show "$iface" 2>/dev/null | grep -oP 'inet \K[0-9./]+' | head -1 || echo ""
 }
 
-# Check if a host is a Ubiquiti/OpenWRT device via SSH banner or HTTP
 identify_powerbeam() {
     local ip="$1"
-    local ssh_opts="-o ConnectTimeout=3 -o StrictHostKeyChecking=no -o BatchMode=yes -o LogLevel=ERROR"
-    local result
-
-    # Try SSH and check for OpenWRT/Ubiquiti identifiers
-    if [[ -n "$SSH_KEY" ]]; then
-        result=$(ssh $ssh_opts -i "$SSH_KEY" "$SSH_USER@$ip" "cat /etc/openwrt_release 2>/dev/null; cat /tmp/sysinfo/board_name 2>/dev/null; cat /tmp/sysinfo/model 2>/dev/null" 2>/dev/null)
-    else
-        result=$(ssh $ssh_opts "$SSH_USER@$ip" "cat /etc/openwrt_release 2>/dev/null; cat /tmp/sysinfo/board_name 2>/dev/null; cat /tmp/sysinfo/model 2>/dev/null" 2>/dev/null)
-    fi
-
-    if [[ -n "$result" ]]; then
-        # Check for PowerBeam/Ubiquiti/OpenWRT keywords
-        if echo "$result" | grep -qiE '(powerbeam|ubiquiti|ubnt|openwrt|lede|airmax|nanobeam|nanostation|litebeam|rocket)'; then
-            echo "$result"
-            return 0
-        fi
-        # Any OpenWRT device is a candidate
-        if echo "$result" | grep -qi 'openwrt'; then
-            echo "$result"
-            return 0
-        fi
-        # SSH worked — could be OpenWRT without release file
-        echo "$result"
+    local ssh_opts="-o ConnectTimeout=3 -o StrictHostKeyChecking=no -o BatchMode=yes"
+    
+    if ssh $ssh_opts "$SSH_USER@$ip" "echo OK" 2>/dev/null; then
+        echo "OpenWRT device"
         return 0
     fi
+    
     return 1
 }
 
-# Auto-discover PowerBeam on the network
 auto_discover() {
     header "Auto-Discovery"
     log "Scanning network for PowerBeam devices..."
@@ -199,162 +177,116 @@ auto_discover() {
 
     if [[ -z "$subnet" ]]; then
         error "No IP address on interface $iface"
-        warning "Make sure the ethernet cable is connected and you have an IP"
-        echo ""
-        echo "Troubleshooting:"
-        echo "  1. Connect ethernet cable to PowerBeam's LAN port"
-        echo "  2. Set a static IP: sudo ip addr add 192.168.1.100/24 dev $iface"
-        echo "  3. Or enable DHCP: sudo dhclient $iface"
         return 1
     fi
 
-    info "Your IP: $subnet on $iface"
+    info "Your subnet: $subnet"
 
     local base_ip
-    base_ip=$(echo "$subnet" | cut -d/ -f1 | sed 's/\.[0-9]*$//') # e.g. 192.168.1
+    base_ip=$(echo "$subnet" | cut -d/ -f1 | sed 's/\.[0-9]*$//')
 
     echo -e "${CYAN}Scanning ${base_ip}.0/24 ...${NC}"
     echo ""
 
     local found_ips=()
-    local found_info=()
-
-    # Phase 1: Fast ping sweep to find live hosts
-    info "Phase 1: Discovering live hosts..."
-    local live_hosts=()
-
-    # Parallel ping sweep (background all pings)
+    
     for i in $(seq 1 254); do
-        ping -c 1 -W 1 "${base_ip}.${i}" &>/dev/null && live_hosts+=("${base_ip}.${i}") &
-    done
-    wait
-
-    if [[ ${#live_hosts[@]} -eq 0 ]]; then
-        # Also try ARP table
-        while IFS= read -r line; do
-            local arp_ip
-            arp_ip=$(echo "$line" | awk '{print $1}')
-            if validate_ip "$arp_ip" 2>/dev/null; then
-                live_hosts+=("$arp_ip")
+        ip="${base_ip}.${i}"
+        if ping -c 1 -W 1 "$ip" &>/dev/null; then
+            echo "  Live: $ip"
+            if identify_powerbeam "$ip" &>/dev/null; then
+                found_ips+=("$ip")
+                echo -e "   ${GREEN}✓ SSH device found${NC}"
             fi
-        done < <(ip neigh show dev "$iface" 2>/dev/null | grep -v FAILED)
-    fi
-
-    local host_count=${#live_hosts[@]}
-    info "Found $host_count live hosts"
-
-    if [[ $host_count -eq 0 ]]; then
-        error "No devices found on the network"
-        return 1
-    fi
-
-    # Phase 2: Identify PowerBeam/OpenWRT devices via SSH
-    info "Phase 2: Identifying devices (SSH probe)..."
-    echo ""
-
-    local idx=0
-    for hip in "${live_hosts[@]}"; do
-        # Skip our own IP
-        local my_ip
-        my_ip=$(echo "$subnet" | cut -d/ -f1)
-        [[ "$hip" == "$my_ip" ]] && continue
-
-        printf "  Probing %-16s ..." "$hip"
-        local dev_info
-        if dev_info=$(identify_powerbeam "$hip" 2>/dev/null); then
-            idx=$((idx + 1))
-            found_ips+=("$hip")
-            local model
-            model=$(echo "$dev_info" | grep -iE '(model|board|DISTRIB_DESCRIPTION)' | head -1 | sed 's/.*=//' | tr -d "'")
-            [[ -z "$model" ]] && model="OpenWRT device"
-            found_info+=("$model")
-            echo -e " ${GREEN}FOUND!${NC} → $model"
-        else
-            echo -e " ${GRAY}not a target${NC}"
         fi
     done
 
     echo ""
 
     if [[ ${#found_ips[@]} -eq 0 ]]; then
-        warning "No PowerBeam/OpenWRT devices found via SSH"
-        echo "Possible causes:"
-        echo "  - PowerBeam not yet configured (default IP 192.168.1.20 or .1.1)"
-        echo "  - SSH not enabled or different credentials"
-        echo "  - Device on different subnet"
+        error "No SSH devices found"
         return 1
     elif [[ ${#found_ips[@]} -eq 1 ]]; then
         POWERBEAM_IP="${found_ips[0]}"
-        success "PowerBeam detected at $POWERBEAM_IP (${found_info[0]})"
+        success "Found: $POWERBEAM_IP"
         return 0
     else
-        # Multiple devices found — let user choose
         echo -e "${WHITE}Multiple devices found:${NC}"
-        echo ""
         for i in "${!found_ips[@]}"; do
-            echo "  $((i + 1)). ${found_ips[$i]}  —  ${found_info[$i]}"
+            echo "  $((i+1)). ${found_ips[$i]}"
         done
         echo ""
-        read -p "Select device (1-${#found_ips[@]}): " dev_choice
+        read -p "Select device [1-${#found_ips[@]}]: " dev_choice
         if validate_int "$dev_choice" 1 ${#found_ips[@]}; then
-            POWERBEAM_IP="${found_ips[$((dev_choice - 1))]}"
+            POWERBEAM_IP="${found_ips[$((dev_choice-1))]}"
             success "Selected: $POWERBEAM_IP"
             return 0
-        else
-            error "Invalid selection"
-            return 1
         fi
     fi
 }
 
 check_connection() {
-    log "Checking PowerBeam connectivity..."
-
-    # Try configured IPs first (fast path)
+    log "Checking PowerBeam at $POWERBEAM_IP..."
+    
     if ping -c 1 -W 2 "$POWERBEAM_IP" &>/dev/null; then
-        log "PowerBeam found at $POWERBEAM_IP"
-        return 0
-    elif ping -c 1 -W 2 "$ALT_IP" &>/dev/null; then
-        POWERBEAM_IP="$ALT_IP"
-        log "PowerBeam found at $ALT_IP (alternate)"
+        log "Host reachable via ping"
+    else
+        warning "Host not responding to ping"
+    fi
+    
+    if ssh_cmd "echo OK"; then
+        success "SSH connection OK"
         return 0
     else
-        warning "PowerBeam not at $POWERBEAM_IP or $ALT_IP — starting auto-discovery..."
-        echo ""
-        auto_discover
-        return $?
+        error "SSH connection failed"
+        return 1
     fi
 }
 
 ssh_cmd() {
     local cmd="$1"
     local timeout="${2:-$TIMEOUT}"
-    local ssh_opts="-o ConnectTimeout=$timeout -o StrictHostKeyChecking=no -o BatchMode=yes -o LogLevel=ERROR"
-
+    local ssh_opts="-o ConnectTimeout=$timeout -o StrictHostKeyChecking=no -o BatchMode=yes"
+    
+    local output
+    local exit_code
+    
     if [[ -n "$SSH_KEY" ]]; then
-        ssh $ssh_opts -i "$SSH_KEY" "$SSH_USER@$POWERBEAM_IP" "$cmd" 2>/dev/null
+        output=$(ssh $ssh_opts -i "$SSH_KEY" "$SSH_USER@$POWERBEAM_IP" "$cmd" 2>&1)
+        exit_code=$?
     else
-        ssh $ssh_opts "$SSH_USER@$POWERBEAM_IP" "$cmd" 2>/dev/null
+        output=$(ssh $ssh_opts "$SSH_USER@$POWERBEAM_IP" "$cmd" 2>&1)
+        exit_code=$?
     fi
+    
+    if [[ $exit_code -ne 0 ]]; then
+        echo "SSH ERROR (exit $exit_code): $output" >&2
+        return $exit_code
+    fi
+    
+    echo "$output"
+    return 0
 }
 
 scp_from() {
     local remote="$1" local_path="$2"
     local ssh_opts="-o ConnectTimeout=$TIMEOUT -o StrictHostKeyChecking=no -o BatchMode=yes"
+    
     if [[ -n "$SSH_KEY" ]]; then
-        scp $ssh_opts -i "$SSH_KEY" "$SSH_USER@$POWERBEAM_IP:$remote" "$local_path"
+        scp $ssh_opts -i "$SSH_KEY" "$SSH_USER@$POWERBEAM_IP:$remote" "$local_path" 2>&1
     else
-        scp $ssh_opts "$SSH_USER@$POWERBEAM_IP:$remote" "$local_path"
+        scp $ssh_opts "$SSH_USER@$POWERBEAM_IP:$remote" "$local_path" 2>&1
     fi
 }
 
 scp_to() {
     local local_path="$1" remote="$2"
     local ssh_opts="-o ConnectTimeout=$TIMEOUT -o StrictHostKeyChecking=no -o BatchMode=yes"
+    
     if [[ -n "$SSH_KEY" ]]; then
-        scp $ssh_opts -i "$SSH_KEY" "$local_path" "$SSH_USER@$POWERBEAM_IP:$remote"
+        scp $ssh_opts -i "$SSH_KEY" "$local_path" "$SSH_USER@$POWERBEAM_IP:$remote" 2>&1
     else
-        scp $ssh_opts "$local_path" "$SSH_USER@$POWERBEAM_IP:$remote"
+        scp $ssh_opts "$local_path" "$SSH_USER@$POWERBEAM_IP:$remote" 2>&1
     fi
 }
 
@@ -2083,7 +2015,6 @@ security_hardening() {
                 echo -e "${CYAN}Checking security configuration...${NC}"
                 echo ""
 
-                # Check SSH
                 local ssh_port
                 ssh_port=$(ssh_cmd "uci get dropbear.@dropbear[0].Port 2>/dev/null")
                 [[ "$ssh_port" == "22" ]] && warning "SSH on default port 22" || success "SSH on non-default port: $ssh_port"
@@ -2092,20 +2023,16 @@ security_hardening() {
                 pw_auth=$(ssh_cmd "uci get dropbear.@dropbear[0].PasswordAuth 2>/dev/null")
                 [[ "$pw_auth" == "0" ]] && success "Password auth disabled" || warning "Password auth enabled — consider key-only"
 
-                # Check firewall
                 local fw_status
                 fw_status=$(ssh_cmd "/etc/init.d/firewall status 2>/dev/null")
                 echo "$fw_status" | grep -q "running" && success "Firewall is running" || warning "Firewall may not be running"
 
-                # Check telnet
                 ssh_cmd "netstat -tuln 2>/dev/null | grep :23" && warning "Telnet port 23 is OPEN" || success "Telnet is not running"
 
-                # Check encryption
                 local enc
                 enc=$(ssh_cmd "uci get wireless.@wifi-iface[0].encryption 2>/dev/null")
                 [[ "$enc" == "none" ]] && warning "WiFi encryption is NONE (open network!)" || success "WiFi encryption: $enc"
 
-                # Check hidden SSID
                 local hidden
                 hidden=$(ssh_cmd "uci get wireless.@wifi-iface[0].hidden 2>/dev/null")
                 [[ "$hidden" == "1" ]] && success "SSID is hidden" || info "SSID is visible (not hidden)"
@@ -2158,12 +2085,12 @@ manage_services() {
             5)
                 read -p "Service name: " svc
                 svc=$(sanitize_string "$svc")
-                ssh_cmd "/etc/init.d/$svc enable" && success "$svc enabled at boot"
+                ssh_cmd "/etc/init.d/$svc enable" && success "$svc enabled" || error "Failed to enable $svc"
                 ;;
             6)
                 read -p "Service name: " svc
                 svc=$(sanitize_string "$svc")
-                ssh_cmd "/etc/init.d/$svc disable" && success "$svc disabled at boot"
+                ssh_cmd "/etc/init.d/$svc disable" && success "$svc disabled" || error "Failed to disable $svc"
                 ;;
             7)
                 read -p "Service name: " svc
@@ -2246,7 +2173,7 @@ show_menu() {
     clear 2>/dev/null
     echo ""
     echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║${WHITE}           PowerBeam M5 400 UX Management Tool v2.0        ${GREEN}║${NC}"
+    echo -e "${GREEN}║${WHITE}           PowerBeam M5 400 UX Management Tool v1.0        ${GREEN}║${NC}"
     echo -e "${GREEN}║${WHITE}                    OpenWRT Edition                        ${GREEN}║${NC}"
     echo -e "${GREEN}║${GRAY}              Copyright © 2026 E.B.G                       ${GREEN}║${NC}"
     echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
@@ -2295,10 +2222,10 @@ main() {
     mkdir -p "$BACKUP_DIR" 2>/dev/null
 
     echo ""
-    echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║${WHITE}           PowerBeam M5 400 UX Management Tool v2.0        ${GREEN}║${NC}"
-    echo -e "${GREEN}║${WHITE}              Initializing connection...                    ${GREEN}║${NC}"
-    echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo -e "${GREEN}╔════════════════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}║${WHITE}    PowerBeam Manager v1.0                       ${GREEN}║${NC}"
+    echo -e "${GREEN}║${WHITE}              Initializing connection...            ${GREEN}║${NC}"
+    echo -e "${GREEN}╚════════════════════════════════════════════════════╝${NC}"
     echo ""
 
     # Detect active ethernet interface
@@ -2309,56 +2236,17 @@ main() {
         info "Ethernet interface detected: $INTERFACE"
     fi
 
-    if ! check_connection; then
-        echo ""
-        error "Auto-discovery failed"
-        echo ""
-        echo "Options:"
-        echo "  1. Enter IP manually"
-        echo "  2. Scan again"
-        echo "  3. Set static IP on interface and retry"
-        echo "  q. Quit"
-        echo ""
-        read -p "Select: " fallback_choice
-        case $fallback_choice in
-            1)
-                read -p "Enter PowerBeam IP: " manual_ip
-                if validate_ip "$manual_ip"; then
-                    POWERBEAM_IP="$manual_ip"
-                    if ! ping -c 1 -W 3 "$POWERBEAM_IP" &>/dev/null; then
-                        warning "IP not responding to ping — trying SSH anyway..."
-                    fi
-                else
-                    error "Invalid IP. Exiting."
-                    exit 1
-                fi
-                ;;
-            2)
-                auto_discover || { error "No device found. Exiting."; exit 1; }
-                ;;
-            3)
-                local iface
-                iface=$(detect_interface)
-                echo "Setting 192.168.1.100/24 on $iface..."
-                sudo ip addr add 192.168.1.100/24 dev "$iface" 2>/dev/null
-                sudo ip link set "$iface" up 2>/dev/null
-                sleep 2
-                check_connection || { error "Still cannot find device. Exiting."; exit 1; }
-                ;;
-            q|Q) exit 0 ;;
-            *) error "Invalid option. Exiting."; exit 1 ;;
-        esac
-    fi
-
-    # Verify SSH access
-    info "Verifying SSH access to $POWERBEAM_IP..."
-    if ssh_cmd "echo ok" &>/dev/null; then
+    # Intentar conexión inicial (silencioso)
+    if check_connection 2>/dev/null; then
         success "SSH connection established — PowerBeam ready!"
     else
-        warning "SSH not responding — some features may not work"
-        warning "Make sure SSH is enabled and credentials are correct (user: $SSH_USER)"
+        warning "SSH connection failed — some features will not work"
+        warning "Use option 21 to set the correct IP address"
     fi
 
+    # ═══════════════════════════════════════════════════
+    # MENÚ PRINCIPAL - SIEMPRE SE MUESTRA
+    # ═══════════════════════════════════════════════════
     while true; do
         show_menu
         read -p " Select option: " choice
@@ -2399,7 +2287,12 @@ main() {
                 if validate_ip "$new_ip"; then
                     POWERBEAM_IP="$new_ip"
                     log "Target IP changed to $POWERBEAM_IP"
-                    check_connection
+                    # Probar conexión con nueva IP
+                    if check_connection 2>/dev/null; then
+                        success "Now connected to $POWERBEAM_IP"
+                    else
+                        warning "Still cannot connect to $POWERBEAM_IP"
+                    fi
                 else
                     error "Invalid IP address"
                 fi
