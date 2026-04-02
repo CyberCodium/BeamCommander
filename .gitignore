@@ -1,0 +1,36 @@
+# ─── OS / Editor ──────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ─── IDEs ─────────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ─── Logs & temporary files ───────────────────────────────────────────────────
+*.log
+/tmp/
+powerbeam-manager.log
+
+# ─── Backups created by the script ───────────────────────────────────────────
+powerbeam-backups/
+
+# ─── SSH keys (never commit!) ─────────────────────────────────────────────────
+*.pem
+*.key
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
+
+# ─── Shell history / credentials ──────────────────────────────────────────────
+.env
+.env.*
