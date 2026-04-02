@@ -1,0 +1,2452 @@
+#!/bin/bash
+# PowerBeam Advanced Management Script v1.1
+# Copyright © 2026 E.B.G - All Rights Reserved
+# Added: WiFi Client Mode with detailed scanning (BSSID/ESSID/Channel/Frequency/Signal/Encryption)
+
+set -o pipefail
+
+# ─── CONFIGURATION ────────────────────────────────────────────────────────────
+INTERFACE="${INTERFACE:-eth0}"
+POWERBEAM_IP="${POWERBEAM_IP:-192.168.1.20}"
+ALT_IP="${ALT_IP:-192.168.1.1}"
+SSH_USER="${SSH_USER:-root}"
+SSH_KEY="${SSH_KEY:-}"
+TIMEOUT="${TIMEOUT:-10}"
+BACKUP_DIR="${BACKUP_DIR:-$HOME/powerbeam-backups}"
+LOG_FILE="${LOG_FILE:-/tmp/powerbeam-manager.log}"
+SCAN_INTERFACE="${SCAN_INTERFACE:-wlan0}"
+
+# PowerBeam M5 400 specs
+PB_FREQ_BAND="5GHz"
+PB_MAX_TX=25
+PB_VALID_CHANNELS_20="36 40 44 48 52 56 60 64 100 104 108 112 116 120 124 128 132 136 140 149 153 157 161 165"
+PB_VALID_CHANNELS_40="36 40 44 48 52 56 60 64 100 104 108 112 116 120 124 128 132 136 140 149 153 157 161"
+PB_VALID_CHANNELS_80="36 40 44 48 52 56 60 64 100 104 108 112 116 120 124 128 149 153 157 161"
+PB_VALID_WIDTHS="20 40 80"
+
+# Global scan results array for WiFi client mode
+scan_networks=()
+
+# ─── COLORS ───────────────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+WHITE='\033[1;37m'
+GRAY='\033[0;90m'
+NC='\033[0m'
+
+# ─── LOGGING ──────────────────────────────────────────────────────────────────
+log() {
+    local msg="[$(date +'%Y-%m-%d %H:%M:%S')] $1"
+    echo -e "${GREEN}${msg}${NC}"
+    echo "$msg" >> "$LOG_FILE"
+}
+
+error() {
+    local msg="[ERROR] $1"
+    echo -e "${RED}${msg}${NC}" >&2
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $msg" >> "$LOG_FILE"
+}
+
+warning() {
+    local msg="[WARNING] $1"
+    echo -e "${YELLOW}${msg}${NC}"
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $msg" >> "$LOG_FILE"
+}
+
+info() {
+    echo -e "${BLUE}[INFO] $1${NC}"
+}
+
+success() {
+    echo -e "${GREEN}[OK] $1${NC}"
+}
+
+header() {
+    echo -e "\n${CYAN}═══ $1 ═══${NC}\n"
+}
+
+# ─── INPUT VALIDATION ─────────────────────────────────────────────────────────
+validate_ip() {
+    local ip="$1"
+    if [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        local IFS='.'
+        read -ra octets <<< "$ip"
+        for octet in "${octets[@]}"; do
+            if (( octet > 255 )); then return 1; fi
+        done
+        return 0
+    fi
+    return 1
+}
+
+validate_channel() {
+    local ch="$1"
+    local width="${2:-20}"
+    local valid_list
+    case "$width" in
+        20) valid_list="$PB_VALID_CHANNELS_20" ;;
+        40) valid_list="$PB_VALID_CHANNELS_40" ;;
+        80) valid_list="$PB_VALID_CHANNELS_80" ;;
+        *) return 1 ;;
+    esac
+    for valid_ch in $valid_list; do
+        if [[ "$ch" == "$valid_ch" ]]; then return 0; fi
+    done
+    return 1
+}
+
+validate_int() {
+    local val="$1" min="$2" max="$3"
+    if [[ "$val" =~ ^[0-9]+$ ]] && (( val >= min && val <= max )); then
+        return 0
+    fi
+    return 1
+}
+
+sanitize_string() {
+    echo "$1" | sed 's/[;&|`$(){}\\<>!'"'"'"]//g'
+}
+
+validate_mac() {
+    [[ "$1" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]
+}
+
+validate_port() {
+    validate_int "$1" 1 65535
+}
+
+validate_subnet() {
+    local subnet="$1"
+    if [[ "$subnet" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+        local ip="${subnet%/*}"
+        local mask="${subnet#*/}"
+        validate_ip "$ip" && (( mask >= 0 && mask <= 32 ))
+        return $?
+    fi
+    return 1
+}
+
+# ─── CONNECTIVITY ─────────────────────────────────────────────────────────────
+
+detect_interface() {
+    local iface
+    for iface in $(ls /sys/class/net/ 2>/dev/null | grep -E '^eth|en'); do
+        if ip link show "$iface" 2>/dev/null | grep -q 'state UP'; then
+            echo "$iface"
+            return 0
+        fi
+    done
+    
+    for iface in $(ls /sys/class/net/ 2>/dev/null | grep -E '^eth|en'); do
+        echo "$iface"
+        return 0
+    done
+    
+    echo "eth0"
+    return 1
+}
+
+get_local_subnet() {
+    local iface="$1"
+    ip -4 addr show "$iface" 2>/dev/null | grep -oP 'inet \K[0-9./]+' | head -1 || echo ""
+}
+
+identify_powerbeam() {
+    local ip="$1"
+    local ssh_opts="-o ConnectTimeout=3 -o StrictHostKeyChecking=no -o BatchMode=yes"
+    
+    if ssh $ssh_opts "$SSH_USER@$ip" "echo OK" 2>/dev/null; then
+        echo "OpenWRT device"
+        return 0
+    fi
+    
+    return 1
+}
+
+auto_discover() {
+    header "Auto-Discovery"
+    log "Scanning network for PowerBeam devices..."
+
+    local iface
+    iface=$(detect_interface)
+    INTERFACE="$iface"
+    info "Using interface: $iface"
+
+    local subnet
+    subnet=$(get_local_subnet "$iface")
+
+    if [[ -z "$subnet" ]]; then
+        error "No IP address on interface $iface"
+        return 1
+    fi
+
+    info "Your subnet: $subnet"
+
+    local base_ip
+    base_ip=$(echo "$subnet" | cut -d/ -f1 | sed 's/\.[0-9]*$//')
+
+    echo -e "${CYAN}Scanning ${base_ip}.0/24 ...${NC}"
+    echo ""
+
+    local found_ips=()
+    
+    for i in $(seq 1 254); do
+        ip="${base_ip}.${i}"
+        if ping -c 1 -W 1 "$ip" &>/dev/null; then
+            echo "  Live: $ip"
+            if identify_powerbeam "$ip" &>/dev/null; then
+                found_ips+=("$ip")
+                echo -e "   ${GREEN}✓ SSH device found${NC}"
+            fi
+        fi
+    done
+
+    echo ""
+
+    if [[ ${#found_ips[@]} -eq 0 ]]; then
+        error "No SSH devices found"
+        return 1
+    elif [[ ${#found_ips[@]} -eq 1 ]]; then
+        POWERBEAM_IP="${found_ips[0]}"
+        success "Found: $POWERBEAM_IP"
+        return 0
+    else
+        echo -e "${WHITE}Multiple devices found:${NC}"
+        for i in "${!found_ips[@]}"; do
+            echo "  $((i+1)). ${found_ips[$i]}"
+        done
+        echo ""
+        read -p "Select device [1-${#found_ips[@]}]: " dev_choice
+        if validate_int "$dev_choice" 1 ${#found_ips[@]}; then
+            POWERBEAM_IP="${found_ips[$((dev_choice-1))]}"
+            success "Selected: $POWERBEAM_IP"
+            return 0
+        fi
+    fi
+}
+
+check_connection() {
+    log "Checking PowerBeam at $POWERBEAM_IP..."
+    
+    if ping -c 1 -W 2 "$POWERBEAM_IP" &>/dev/null; then
+        log "Host reachable via ping"
+    else
+        warning "Host not responding to ping"
+    fi
+    
+    if ssh_cmd "echo OK"; then
+        success "SSH connection OK"
+        return 0
+    else
+        error "SSH connection failed"
+        return 1
+    fi
+}
+
+ssh_cmd() {
+    local cmd="$1"
+    local timeout="${2:-$TIMEOUT}"
+    local ssh_opts="-o ConnectTimeout=$timeout -o StrictHostKeyChecking=no -o BatchMode=yes"
+    
+    local output
+    local exit_code
+    
+    if [[ -n "$SSH_KEY" ]]; then
+        output=$(ssh $ssh_opts -i "$SSH_KEY" "$SSH_USER@$POWERBEAM_IP" "$cmd" 2>&1)
+        exit_code=$?
+    else
+        output=$(ssh $ssh_opts "$SSH_USER@$POWERBEAM_IP" "$cmd" 2>&1)
+        exit_code=$?
+    fi
+    
+    if [[ $exit_code -ne 0 ]]; then
+        echo "SSH ERROR (exit $exit_code): $output" >&2
+        return $exit_code
+    fi
+    
+    echo "$output"
+    return 0
+}
+
+scp_from() {
+    local remote="$1" local_path="$2"
+    local ssh_opts="-o ConnectTimeout=$TIMEOUT -o StrictHostKeyChecking=no -o BatchMode=yes"
+    
+    if [[ -n "$SSH_KEY" ]]; then
+        scp $ssh_opts -i "$SSH_KEY" "$SSH_USER@$POWERBEAM_IP:$remote" "$local_path" 2>&1
+    else
+        scp $ssh_opts "$SSH_USER@$POWERBEAM_IP:$remote" "$local_path" 2>&1
+    fi
+}
+
+scp_to() {
+    local local_path="$1" remote="$2"
+    local ssh_opts="-o ConnectTimeout=$TIMEOUT -o StrictHostKeyChecking=no -o BatchMode=yes"
+    
+    if [[ -n "$SSH_KEY" ]]; then
+        scp $ssh_opts -i "$SSH_KEY" "$local_path" "$SSH_USER@$POWERBEAM_IP:$remote" 2>&1
+    else
+        scp $ssh_opts "$local_path" "$SSH_USER@$POWERBEAM_IP:$remote" 2>&1
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 1. SYSTEM INFORMATION
+# ═══════════════════════════════════════════════════════════════════════════════
+get_system_info() {
+    header "PowerBeam System Information"
+
+    echo -e "${WHITE}Target:${NC} $POWERBEAM_IP | ${WHITE}Band:${NC} $PB_FREQ_BAND | ${WHITE}Interface:${NC} $INTERFACE"
+    echo ""
+
+    header "OpenWRT Version"
+    ssh_cmd "cat /etc/openwrt_release 2>/dev/null || cat /etc/banner 2>/dev/null" || echo "Failed to get version"
+
+    header "Hardware Info"
+    ssh_cmd "cat /tmp/sysinfo/board_name 2>/dev/null; echo ''; cat /proc/cpuinfo 2>/dev/null | head -5" || echo "Failed to get hardware info"
+
+    header "Memory Usage"
+    ssh_cmd "free -m 2>/dev/null || cat /proc/meminfo | head -5" || echo "Failed to get memory info"
+
+    header "Storage"
+    ssh_cmd "df -h" || echo "Failed to get storage info"
+
+    header "Uptime & Load"
+    ssh_cmd "uptime" || echo "Failed to get uptime"
+
+    header "Wireless Status"
+    ssh_cmd "iwinfo wlan0 info 2>/dev/null" || echo "Failed to get wireless info"
+
+    header "Connected Stations"
+    ssh_cmd "iwinfo wlan0 assoclist 2>/dev/null" || echo "No stations"
+
+    header "Network Interfaces"
+    ssh_cmd "ip addr show 2>/dev/null || ifconfig" || echo "Failed to get network info"
+
+    header "Active Connections"
+    ssh_cmd "netstat -tuln 2>/dev/null | head -20" || echo "Failed to get connections"
+
+    header "Running Processes"
+    ssh_cmd "ps w 2>/dev/null | head -20" || echo "Failed to get processes"
+
+    header "Temperature"
+    ssh_cmd "cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | awk '{printf \"%.1f°C\n\", \$1/1000}'" || echo "Temperature sensor not available"
+
+    header "Kernel"
+    ssh_cmd "uname -a" || echo "Failed to get kernel info"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2. WIRELESS CONFIGURATION (AP MODE)
+# ═══════════════════════════════════════════════════════════════════════════════
+configure_wireless() {
+    while true; do
+        header "Wireless Configuration (AP Mode - 5 GHz)"
+
+        echo -e "${WHITE}Current wireless config:${NC}"
+        ssh_cmd "uci show wireless 2>/dev/null" || echo "Failed to read config"
+        echo ""
+
+        echo " 1. Set channel (5 GHz: 36-165)"
+        echo " 2. Set TX power (0-$PB_MAX_TX dBm)"
+        echo " 3. Set SSID"
+        echo " 4. Set channel width (20/40/80 MHz)"
+        echo " 5. Set wireless mode (ap/sta/adhoc/mesh)"
+        echo " 6. Set encryption (none/wpa2/wpa3)"
+        echo " 7. Set country code"
+        echo " 8. Enable/disable radio"
+        echo " 9. Set distance optimization"
+        echo "10. Set RTS/CTS threshold"
+        echo "11. Set fragmentation threshold"
+        echo "12. Set beacon interval"
+        echo "13. Set DTIM period"
+        echo "14. Hide/show SSID"
+        echo "15. Set max clients"
+        echo "16. Set noise immunity"
+        echo "17. Enable/disable DFS"
+        echo "18. Enable/disable 802.11n/ac features"
+        echo "19. Scan nearby networks"
+        echo "20. Show current wireless details"
+        echo " 0. Back"
+        echo ""
+        read -p "Select option: " choice
+
+        case $choice in
+            1)
+                echo "Valid 5 GHz channels (20 MHz): $PB_VALID_CHANNELS_20"
+                read -p "Enter channel: " channel
+                if validate_channel "$channel"; then
+                    ssh_cmd "uci set wireless.@wifi-device[0].channel=$channel; uci commit wireless; wifi reload"
+                    success "Channel set to $channel"
+                else
+                    error "Invalid channel for 5 GHz band"
+                fi
+                ;;
+            2)
+                read -p "Enter TX power (0-$PB_MAX_TX dBm): " power
+                if validate_int "$power" 0 "$PB_MAX_TX"; then
+                    ssh_cmd "uci set wireless.@wifi-device[0].txpower=$power; uci commit wireless; wifi reload"
+                    success "TX power set to $power dBm"
+                else
+                    error "Invalid TX power (must be 0-$PB_MAX_TX)"
+                fi
+                ;;
+            3)
+                read -p "Enter new SSID: " ssid_raw
+                local ssid
+                ssid=$(sanitize_string "$ssid_raw")
+                if [[ -z "$ssid" ]]; then
+                    error "Invalid SSID"
+                elif (( ${#ssid} > 32 )); then
+                    error "SSID too long (max 32 chars)"
+                else
+                    ssh_cmd "uci set wireless.@wifi-iface[0].ssid='$ssid'; uci commit wireless; wifi reload"
+                    success "SSID set to: $ssid"
+                fi
+                ;;
+            4)
+                echo "Available widths: 20 40 80 MHz"
+                read -p "Enter channel width: " width
+                if [[ " $PB_VALID_WIDTHS " == *" $width "* ]]; then
+                    local htmode
+                    case "$width" in
+                        20) htmode="VHT20" ;;
+                        40) htmode="VHT40" ;;
+                        80) htmode="VHT80" ;;
+                    esac
+                    ssh_cmd "uci set wireless.@wifi-device[0].htmode=$htmode; uci commit wireless; wifi reload"
+                    success "Channel width set to $width MHz ($htmode)"
+                else
+                    error "Invalid channel width"
+                fi
+                ;;
+            5)
+                echo "Modes: ap (Access Point), sta (Station/Client), adhoc, mesh"
+                read -p "Enter mode: " mode
+                if [[ "$mode" =~ ^(ap|sta|adhoc|mesh)$ ]]; then
+                    ssh_cmd "uci set wireless.@wifi-iface[0].mode=$mode; uci commit wireless; wifi reload"
+                    success "Wireless mode set to: $mode"
+                else
+                    error "Invalid mode"
+                fi
+                ;;
+            6)
+                echo "1. None (open)"
+                echo "2. WPA2-PSK"
+                echo "3. WPA3-SAE"
+                echo "4. WPA2/WPA3 mixed"
+                read -p "Select encryption: " enc_choice
+                case $enc_choice in
+                    1)
+                        ssh_cmd "uci set wireless.@wifi-iface[0].encryption=none; uci delete wireless.@wifi-iface[0].key 2>/dev/null; uci commit wireless; wifi reload"
+                        success "Encryption disabled (open network)"
+                        ;;
+                    2)
+                        read -sp "Enter WPA2 password (8-63 chars): " wpa_key
+                        echo ""
+                        if (( ${#wpa_key} >= 8 && ${#wpa_key} <= 63 )); then
+                            wpa_key=$(sanitize_string "$wpa_key")
+                            ssh_cmd "uci set wireless.@wifi-iface[0].encryption=psk2; uci set wireless.@wifi-iface[0].key='$wpa_key'; uci commit wireless; wifi reload"
+                            success "WPA2-PSK configured"
+                        else
+                            error "Password must be 8-63 characters"
+                        fi
+                        ;;
+                    3)
+                        read -sp "Enter WPA3 password (8-63 chars): " wpa_key
+                        echo ""
+                        if (( ${#wpa_key} >= 8 && ${#wpa_key} <= 63 )); then
+                            wpa_key=$(sanitize_string "$wpa_key")
+                            ssh_cmd "uci set wireless.@wifi-iface[0].encryption=sae; uci set wireless.@wifi-iface[0].key='$wpa_key'; uci commit wireless; wifi reload"
+                            success "WPA3-SAE configured"
+                        else
+                            error "Password must be 8-63 characters"
+                        fi
+                        ;;
+                    4)
+                        read -sp "Enter password (8-63 chars): " wpa_key
+                        echo ""
+                        if (( ${#wpa_key} >= 8 && ${#wpa_key} <= 63 )); then
+                            wpa_key=$(sanitize_string "$wpa_key")
+                            ssh_cmd "uci set wireless.@wifi-iface[0].encryption=sae-mixed; uci set wireless.@wifi-iface[0].key='$wpa_key'; uci commit wireless; wifi reload"
+                            success "WPA2/WPA3 mixed configured"
+                        else
+                            error "Password must be 8-63 characters"
+                        fi
+                        ;;
+                esac
+                ;;
+            7)
+                read -p "Enter country code (e.g. ES, US, DE): " country
+                country=$(echo "$country" | tr '[:lower:]' '[:upper:]' | sed 's/[^A-Z]//g')
+                if [[ ${#country} -eq 2 ]]; then
+                    ssh_cmd "uci set wireless.@wifi-device[0].country=$country; uci commit wireless; wifi reload"
+                    success "Country code set to $country"
+                else
+                    error "Invalid country code (must be 2 letters)"
+                fi
+                ;;
+            8)
+                echo "1. Enable radio"
+                echo "2. Disable radio"
+                read -p "Select: " rc
+                case $rc in
+                    1) ssh_cmd "uci set wireless.@wifi-device[0].disabled=0; uci commit wireless; wifi reload"; success "Radio enabled" ;;
+                    2) ssh_cmd "uci set wireless.@wifi-device[0].disabled=1; uci commit wireless; wifi reload"; success "Radio disabled" ;;
+                esac
+                ;;
+            9)
+                echo "Distance in meters to the remote antenna (affects ACK timeout)"
+                read -p "Enter distance in meters: " distance
+                if validate_int "$distance" 0 100000; then
+                    ssh_cmd "uci set wireless.@wifi-device[0].distance=$distance; uci commit wireless; wifi reload"
+                    success "Distance optimization set to ${distance}m"
+                else
+                    error "Invalid distance"
+                fi
+                ;;
+            10)
+                read -p "Enter RTS threshold (0-2347, 0=off): " rts
+                if validate_int "$rts" 0 2347; then
+                    ssh_cmd "uci set wireless.@wifi-device[0].rts=$rts; uci commit wireless; wifi reload"
+                    success "RTS threshold set to $rts"
+                else
+                    error "Invalid RTS threshold"
+                fi
+                ;;
+            11)
+                read -p "Enter fragmentation threshold (256-2346): " frag
+                if validate_int "$frag" 256 2346; then
+                    ssh_cmd "uci set wireless.@wifi-device[0].frag=$frag; uci commit wireless; wifi reload"
+                    success "Fragmentation threshold set to $frag"
+                else
+                    error "Invalid fragmentation threshold"
+                fi
+                ;;
+            12)
+                read -p "Enter beacon interval (15-65535 ms, default 100): " beacon
+                if validate_int "$beacon" 15 65535; then
+                    ssh_cmd "uci set wireless.@wifi-device[0].beacon_int=$beacon; uci commit wireless; wifi reload"
+                    success "Beacon interval set to $beacon ms"
+                else
+                    error "Invalid beacon interval"
+                fi
+                ;;
+            13)
+                read -p "Enter DTIM period (1-255, default 2): " dtim
+                if validate_int "$dtim" 1 255; then
+                    ssh_cmd "uci set wireless.@wifi-iface[0].dtim_period=$dtim; uci commit wireless; wifi reload"
+                    success "DTIM period set to $dtim"
+                else
+                    error "Invalid DTIM period"
+                fi
+                ;;
+            14)
+                echo "1. Hide SSID"
+                echo "2. Show SSID"
+                read -p "Select: " hc
+                case $hc in
+                    1) ssh_cmd "uci set wireless.@wifi-iface[0].hidden=1; uci commit wireless; wifi reload"; success "SSID hidden" ;;
+                    2) ssh_cmd "uci set wireless.@wifi-iface[0].hidden=0; uci commit wireless; wifi reload"; success "SSID visible" ;;
+                esac
+                ;;
+            15)
+                read -p "Enter max clients (0=unlimited, 1-128): " maxclients
+                if validate_int "$maxclients" 0 128; then
+                    ssh_cmd "uci set wireless.@wifi-iface[0].maxassoc=$maxclients; uci commit wireless; wifi reload"
+                    success "Max clients set to $maxclients"
+                else
+                    error "Invalid value"
+                fi
+                ;;
+            16)
+                read -p "Enter noise immunity level (0-4): " ni
+                if validate_int "$ni" 0 4; then
+                    ssh_cmd "uci set wireless.@wifi-device[0].noscan=$ni; uci commit wireless; wifi reload"
+                    success "Noise immunity set to $ni"
+                else
+                    error "Invalid level"
+                fi
+                ;;
+            17)
+                echo "1. Enable DFS"
+                echo "2. Disable DFS"
+                read -p "Select: " dfs_choice
+                case $dfs_choice in
+                    1) ssh_cmd "uci set wireless.@wifi-device[0].dfs=1; uci commit wireless; wifi reload"; success "DFS enabled" ;;
+                    2) ssh_cmd "uci set wireless.@wifi-device[0].dfs=0; uci commit wireless; wifi reload"; success "DFS disabled" ;;
+                esac
+                ;;
+            18)
+                echo "1. Enable short GI (faster, less range)"
+                echo "2. Disable short GI (slower, more robust)"
+                echo "3. Enable LDPC"
+                echo "4. Enable STBC"
+                echo "5. Enable frame aggregation (A-MPDU)"
+                read -p "Select: " ac_choice
+                case $ac_choice in
+                    1) ssh_cmd "uci set wireless.@wifi-device[0].short_gi_40=1; uci set wireless.@wifi-device[0].short_gi_80=1; uci commit wireless; wifi reload"; success "Short GI enabled" ;;
+                    2) ssh_cmd "uci set wireless.@wifi-device[0].short_gi_40=0; uci set wireless.@wifi-device[0].short_gi_80=0; uci commit wireless; wifi reload"; success "Short GI disabled" ;;
+                    3) ssh_cmd "uci set wireless.@wifi-device[0].ldpc=1; uci commit wireless; wifi reload"; success "LDPC enabled" ;;
+                    4) ssh_cmd "uci set wireless.@wifi-device[0].stbc=1; uci commit wireless; wifi reload"; success "STBC enabled" ;;
+                    5) ssh_cmd "uci set wireless.@wifi-device[0].ampdu=1; uci commit wireless; wifi reload"; success "A-MPDU enabled" ;;
+                esac
+                ;;
+            19) wireless_scan ;;
+            20)
+                header "Detailed Wireless Info"
+                ssh_cmd "iwinfo wlan0 info 2>/dev/null"
+                echo ""
+                ssh_cmd "iw dev wlan0 info 2>/dev/null"
+                echo ""
+                ssh_cmd "uci show wireless 2>/dev/null"
+                ;;
+            0) return ;;
+        esac
+
+        echo ""
+        read -p "Press Enter to continue..."
+    done
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 3. WIFI SCAN DETAILED (for client mode)
+# ═══════════════════════════════════════════════════════════════════════════════
+wifi_scan_detailed() {
+    header "WiFi Scan (Detailed)"
+    log "Scanning for WiFi networks..."
+    
+    # Reset scan array
+    scan_networks=()
+    
+    # Obtener scan
+    local scan_output
+    scan_output=$(ssh_cmd "iwinfo wlan0 scan 2>/dev/null")
+    if [[ -z "$scan_output" ]]; then
+        error "Scan failed or no networks found. Is wlan0 up?"
+        return 1
+    fi
+    
+    # Parsear resultados
+    local current_bssid current_essid current_channel current_freq current_enc current_signal
+    while IFS= read -r line; do
+        if [[ $line =~ ^BSSID:[[:space:]]*([0-9A-Fa-f:]+) ]]; then
+            # Guardar red anterior si existe
+            if [[ -n "$current_bssid" ]]; then
+                scan_networks+=("$current_bssid|$current_essid|$current_channel|$current_freq|$current_enc|$current_signal")
+            fi
+            current_bssid="${BASH_REMATCH[1]}"
+            current_essid=""
+            current_channel=""
+            current_freq=""
+            current_enc=""
+            current_signal=""
+        elif [[ $line =~ ^ESSID:[[:space:]]*\"?(.*)\"?$ ]]; then
+            current_essid="${BASH_REMATCH[1]}"
+            # Quitar comillas si las hay
+            current_essid="${current_essid%\"}"
+            current_essid="${current_essid#\"}"
+        elif [[ $line =~ ^Channel:[[:space:]]*([0-9]+) ]]; then
+            current_channel="${BASH_REMATCH[1]}"
+        elif [[ $line =~ ^Frequency:[[:space:]]*([0-9.]+)[[:space:]]*GHz ]]; then
+            current_freq="${BASH_REMATCH[1]} GHz"
+        elif [[ $line =~ ^Encryption:[[:space:]]*(.+) ]]; then
+            current_enc="${BASH_REMATCH[1]}"
+        elif [[ $line =~ ^Signal:[[:space:]]*(-[0-9]+) ]]; then
+            current_signal="${BASH_REMATCH[1]} dBm"
+        fi
+    done <<< "$scan_output"
+    
+    # Guardar la última red
+    if [[ -n "$current_bssid" ]]; then
+        scan_networks+=("$current_bssid|$current_essid|$current_channel|$current_freq|$current_enc|$current_signal")
+    fi
+    
+    # Mostrar tabla
+    echo -e "${WHITE}Idx  BSSID              ESSID               Chan | Freq   | Enc       | Signal${NC}"
+    echo "---  -----------------  -----------------  ----  -------  ---------  ------"
+    local idx=1
+    for net in "${scan_networks[@]}"; do
+        IFS='|' read -r bssid essid channel freq enc signal <<< "$net"
+        # Truncar ESSID si es muy largo
+        if [[ ${#essid} -gt 32 ]]; then
+            essid="${essid:0:29}..."
+        fi
+        printf "%-4s %-18s %-32s %-4s | %-7s | %-9s | %-6s\n" "$idx" "$bssid" "$essid" "$channel" "$freq" "$enc" "$signal"
+        ((idx++))
+    done
+    echo "---"
+    echo "Total: ${#scan_networks[@]} networks"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 22. CONFIGURE AS WIFI CLIENT (STA MODE)
+# ═══════════════════════════════════════════════════════════════════════════════
+configure_wifi_client() {
+    header "WiFi Client Configuration (Station Mode)"
+    warning "This will make PowerBeam connect to ANOTHER WiFi network as a client"
+    warning "PowerBeam will STOP being an Access Point"
+    echo ""
+
+    echo "Current mode: $(ssh_cmd \"uci get wireless.@wifi-iface[0].mode 2>/dev/null\" || echo 'ap')"
+    echo ""
+
+    echo "1. Scan for available networks (detailed)"
+    echo "2. Connect to a network"
+    echo "3. Show current client status"
+    echo "4. Disable client mode (return to AP mode)"
+    echo "0. Back"
+    echo ""
+    read -p "Select option: " choice
+
+    case $choice in
+        1) 
+            wifi_scan_detailed || return
+            ;;
+        2)
+            # Si no hay redes escaneadas, escanear primero
+            if [[ ${#scan_networks[@]} -eq 0 ]]; then
+                warning "No scan data. Scanning first..."
+                wifi_scan_detailed || return
+            fi
+            # Mostrar redes disponibles
+            wifi_scan_detailed
+            read -p "Select network index to connect: " net_idx
+            if ! validate_int "$net_idx" 1 ${#scan_networks[@]}; then
+                error "Invalid index"
+                return
+            fi
+            IFS='|' read -r bssid essid channel freq enc signal <<< "${scan_networks[$((net_idx-1))]}"
+            echo ""
+            echo "Connecting to:"
+            echo "  ESSID: $essid"
+            echo "  BSSID: $bssid"
+            echo "  Channel: $channel"
+            echo "  Frequency: $freq"
+            echo "  Encryption: $enc"
+            echo "  Signal: $signal"
+            echo ""
+            # Elegir encryption type (OpenWRT usa nombres específicos)
+            echo "Select encryption type:"
+            echo "1. None (open network)"
+            echo "2. WPA2-PSK"
+            echo "3. WPA3-SAE"
+            echo "4. WPA2/WPA3 mixed"
+            read -p "Choice [1-4]: " enc_choice
+            case $enc_choice in
+                1) encryption="none" ;;
+                2) encryption="psk2" ;;
+                3) encryption="sae" ;;
+                4) encryption="sae-mixed" ;;
+                *) error "Invalid encryption type"; return ;;
+            esac
+            # Password si no es abierta
+            if [[ "$encryption" != "none" ]]; then
+                read -sp "Password: " password
+                echo ""
+            fi
+            warning "Configuring WiFi client..."
+            # Configurar modo STA
+            ssh_cmd "uci set wireless.@wifi-iface[0].mode='sta'"
+            ssh_cmd "uci set wireless.@wifi-iface[0].ssid='$essid'"
+            ssh_cmd "uci set wireless.@wifi-iface[0].encryption='$encryption'"
+            [[ -n "$password" ]] && ssh_cmd "uci set wireless.@wifi-iface[0].key='$password'"
+            # Asignar a red WAN para que obtenga IP por DHCP
+            ssh_cmd "uci set wireless.@wifi-iface[0].network='wan'"
+            ssh_cmd "uci commit wireless"
+            ssh_cmd "wifi reload"
+            success "Connecting to '$essid'..."
+            sleep 5
+            # Mostrar estado de conexión
+            echo "Connection status:"
+            ssh_cmd "iw dev wlan0 link 2>/dev/null" || echo "Not connected yet."
+            echo ""
+            echo "IP address:"
+            ssh_cmd "ip addr show wlan0 2>/dev/null | grep inet || ifconfig wlan0 2>/dev/null | grep inet"
+            # Preguntar si actualizar POWERBEAM_IP en el script
+            local new_ip
+            new_ip=$(ssh_cmd "ip -4 addr show wlan0 2>/dev/null | grep -oP 'inet \K[0-9.]+' | head -1")
+            if [[ -n "$new_ip" && "$new_ip" != "$POWERBEAM_IP" ]]; then
+                read -p "Update POWERBEAM_IP from $POWERBEAM_IP to $new_ip? (y/N): " update
+                if [[ $update =~ ^[Yy]$ ]]; then
+                    POWERBEAM_IP="$new_ip"
+                    success "POWERBEAM_IP updated to $new_ip"
+                fi
+            fi
+            ;;
+        3)
+            header "WiFi Client Status"
+            ssh_cmd "uci show wireless.@wifi-iface[0] 2>/dev/null"
+            echo ""
+            echo "IP Configuration:"
+            ssh_cmd "ip addr show wlan0 2>/dev/null || ifconfig wlan0"
+            echo ""
+            echo "Connection details:"
+            ssh_cmd "iw dev wlan0 link 2>/dev/null" || echo "Not connected."
+            ;;
+        4)
+            warning "Returning to AP mode (Access Point)..."
+            # Cambiar modo a AP
+            ssh_cmd "uci set wireless.@wifi-iface[0].mode='ap'"
+            ssh_cmd "uci set wireless.@wifi-iface[0].network='lan'"
+            ssh_cmd "uci commit wireless"
+            ssh_cmd "wifi reload"
+            success "Back to AP mode. Use Wireless Configuration (option 3) to set SSID and security."
+            ;;
+        0) return ;;
+    esac
+
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 4. WIRELESS SCAN (SIMPLE - for AP mode)
+# ═══════════════════════════════════════════════════════════════════════════════
+wireless_scan() {
+    header "Wireless Network Scan (5 GHz)"
+    log "Scanning for nearby 5 GHz networks..."
+
+    ssh_cmd "iwinfo wlan0 scan 2>/dev/null" || ssh_cmd "iw dev wlan0 scan 2>/dev/null" || error "Scan failed"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 5. MONITOR MODE & PACKET CAPTURE
+# ═══════════════════════════════════════════════════════════════════════════════
+monitor_mode() {
+    while true; do
+        header "Monitor Mode & Packet Capture"
+        warning "OpenWRT has limited monitor mode capabilities on some drivers"
+
+        echo "1. Create monitor interface"
+        echo "2. Destroy monitor interface"
+        echo "3. Capture packets (tcpdump)"
+        echo "4. Capture to file & download"
+        echo "5. Capture specific traffic"
+        echo "6. Show wireless frames"
+        echo "0. Back"
+        echo ""
+        read -p "Select option: " choice
+
+        case $choice in
+            1)
+                ssh_cmd "iw phy phy0 interface add mon0 type monitor 2>/dev/null && ifconfig mon0 up 2>/dev/null && echo 'Monitor interface mon0 created'" || error "Failed to create monitor interface"
+                ;;
+            2)
+                ssh_cmd "ifconfig mon0 down 2>/dev/null; iw dev mon0 del 2>/dev/null"
+                success "Monitor interface removed"
+                ;;
+            3)
+                read -p "Interface (default mon0): " cap_iface
+                cap_iface="${cap_iface:-mon0}"
+                cap_iface=$(sanitize_string "$cap_iface")
+                read -p "Number of packets (default 100): " pkt_count
+                pkt_count="${pkt_count:-100}"
+                log "Capturing $pkt_count packets on $cap_iface..."
+                ssh_cmd "tcpdump -i $cap_iface -c $pkt_count -n 2>/dev/null" || error "Capture failed"
+                ;;
+            4)
+                read -p "Interface (default mon0): " cap_iface
+                cap_iface="${cap_iface:-mon0}"
+                cap_iface=$(sanitize_string "$cap_iface")
+                read -p "Duration in seconds (default 30): " duration
+                duration="${duration:-30}"
+                local cap_file="/tmp/capture_$(date +%s).pcap"
+                local local_file="$BACKUP_DIR/capture_$(date +%Y%m%d_%H%M%S).pcap"
+                mkdir -p "$BACKUP_DIR"
+                log "Capturing for ${duration}s..."
+                ssh_cmd "timeout $duration tcpdump -i $cap_iface -w $cap_file 2>/dev/null" &
+                sleep "$((duration + 2))"
+                scp_from "$cap_file" "$local_file"
+                ssh_cmd "rm -f $cap_file"
+                success "Capture saved to $local_file"
+                ;;
+            5)
+                echo "Filter options:"
+                echo "1. Specific IP"
+                echo "2. Specific port"
+                echo "3. DNS traffic"
+                echo "4. HTTP traffic"
+                echo "5. ARP traffic"
+                read -p "Select: " fc
+                local filter
+                case $fc in
+                    1) read -p "IP: " fip; filter="host $(sanitize_string "$fip")" ;;
+                    2) read -p "Port: " fport; filter="port $(sanitize_string "$fport")" ;;
+                    3) filter="port 53" ;;
+                    4) filter="port 80 or port 443" ;;
+                    5) filter="arp" ;;
+                    *) filter="" ;;
+                esac
+                log "Capturing with filter: $filter"
+                ssh_cmd "tcpdump -i wlan0 -c 50 -n '$filter' 2>/dev/null" || error "Capture failed"
+                ;;
+            6)
+                log "Capturing wireless management frames..."
+                ssh_cmd "tcpdump -i mon0 -c 30 -n 'type mgt' 2>/dev/null" || error "Capture failed"
+                ;;
+            0) return ;;
+        esac
+
+        echo ""
+        read -p "Press Enter to continue..."
+    done
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 6. ANTENNA ALIGNMENT
+# ═══════════════════════════════════════════════════════════════════════════════
+antenna_alignment() {
+    header "Antenna Alignment Tool"
+
+    echo -e "${WHITE}This tool helps align your PowerBeam M5 400 UX for optimal signal${NC}"
+    echo "Make sure the remote device is configured and responding"
+    echo ""
+
+    header "Current Signal"
+    ssh_cmd "iwinfo wlan0 assoclist 2>/dev/null" || echo "No associated stations"
+
+    echo ""
+    header "Signal Quality"
+    local sig_info
+    sig_info=$(ssh_cmd "iwinfo wlan0 info 2>/dev/null | grep -E '(Signal|Noise|Bit Rate|Link Quality)'")
+    echo "$sig_info"
+
+    echo ""
+    echo -e "${CYAN}Alignment Tips for PowerBeam M5 400 UX:${NC}"
+    echo " 1. Loosen the mounting bracket slightly"
+    echo " 2. Use the LED indicators on the device (signal bars)"
+    echo " 3. Aim for Signal > -65 dBm for optimal throughput"
+    echo " 4. Signal -50 to -60 dBm = Excellent"
+    echo " 5. Signal -60 to -70 dBm = Good"
+    echo " 6. Signal -70 to -80 dBm = Fair"
+    echo " 7. Signal < -80 dBm = Poor — realign needed"
+    echo " 8. Tighten all bolts once aligned"
+    echo ""
+
+    read -p "Monitor signal in real-time? (y/N): " monitor
+    if [[ $monitor =~ ^[Yy]$ ]]; then
+        read -p "Refresh interval in seconds (default 1): " interval
+        interval="${interval:-1}"
+        log "Monitoring signal... (Ctrl+C to stop)"
+        echo ""
+        trap 'echo ""; log "Monitoring stopped"; return' INT
+        local count=0
+        while true; do
+            count=$((count + 1))
+            local line
+            line=$(ssh_cmd "iwinfo wlan0 info 2>/dev/null | grep -E '(Signal|Noise|Bit Rate)'" 3)
+            local signal
+            signal=$(echo "$line" | grep -oP 'Signal: \K-?[0-9]+' 2>/dev/null)
+            local noise
+            noise=$(echo "$line" | grep -oP 'Noise: \K-?[0-9]+' 2>/dev/null)
+
+            # Visual bar
+            local bar_len=0
+            if [[ -n "$signal" ]]; then
+                bar_len=$(( (signal + 100) * 2 ))
+                (( bar_len < 0 )) && bar_len=0
+                (( bar_len > 50 )) && bar_len=50
+            fi
+            local bar
+            bar=$(printf '%*s' "$bar_len" '' | tr ' ' '█')
+            local empty
+            empty=$(printf '%*s' "$((50 - bar_len))" '' | tr ' ' '░')
+
+            local color="$RED"
+            if [[ -n "$signal" ]]; then
+                (( signal > -60 )) && color="$GREEN"
+                (( signal <= -60 && signal > -70 )) && color="$YELLOW"
+                (( signal <= -70 && signal > -80 )) && color="$RED"
+            fi
+
+            printf "\r${GRAY}[%04d]${NC} Signal: ${color}%s dBm${NC} | Noise: %s dBm | SNR: %s dB | ${color}%s${NC}%s" \
+                "$count" "${signal:---}" "${noise:---}" \
+                "$(if [[ -n "$signal" && -n "$noise" ]]; then echo "$((signal - noise))"; else echo "--"; fi)" \
+                "$bar" "$empty"
+
+            sleep "$interval"
+        done
+        trap - INT
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 7. NETWORK CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
+configure_network() {
+    while true; do
+        header "Network Configuration"
+
+        echo " 1. Show current network config"
+        echo " 2. Set LAN IP address"
+        echo " 3. Set LAN subnet mask"
+        echo " 4. Set default gateway"
+        echo " 5. Set DNS servers"
+        echo " 6. Configure DHCP server"
+        echo " 7. Set static routes"
+        echo " 8. Configure VLANs"
+        echo " 9. Configure bridge"
+        echo "10. Set MTU"
+        echo "11. Enable/disable NAT (masquerade)"
+        echo "12. Set hostname"
+        echo "13. Set timezone"
+        echo "14. ARP table"
+        echo "15. Routing table"
+        echo " 0. Back"
+        echo ""
+        read -p "Select option: " choice
+
+        case $choice in
+            1)
+                header "Network Configuration"
+                ssh_cmd "uci show network 2>/dev/null"
+                echo ""
+                ssh_cmd "ip addr show 2>/dev/null || ifconfig"
+                ;;
+            2)
+                read -p "Enter new LAN IP (e.g. 192.168.1.20): " new_ip
+                if validate_ip "$new_ip"; then
+                    warning "Changing IP will disconnect you! New IP: $new_ip"
+                    read -p "Continue? (y/N): " confirm
+                    if [[ $confirm =~ ^[Yy]$ ]]; then
+                        ssh_cmd "uci set network.lan.ipaddr='$new_ip'; uci commit network; /etc/init.d/network restart"
+                        POWERBEAM_IP="$new_ip"
+                        success "LAN IP changed to $new_ip — reconnecting..."
+                        sleep 5
+                        check_connection
+                    fi
+                else
+                    error "Invalid IP address"
+                fi
+                ;;
+            3)
+                read -p "Enter subnet mask (e.g. 255.255.255.0): " mask
+                if validate_ip "$mask"; then
+                    ssh_cmd "uci set network.lan.netmask='$mask'; uci commit network; /etc/init.d/network restart"
+                    success "Subnet mask set to $mask"
+                else
+                    error "Invalid subnet mask"
+                fi
+                ;;
+            4)
+                read -p "Enter default gateway IP: " gw
+                if validate_ip "$gw"; then
+                    ssh_cmd "uci set network.lan.gateway='$gw'; uci commit network; /etc/init.d/network restart"
+                    success "Gateway set to $gw"
+                else
+                    error "Invalid gateway"
+                fi
+                ;;
+            5)
+                read -p "Enter DNS servers (space separated): " dns_raw
+                local dns
+                dns=$(sanitize_string "$dns_raw")
+                ssh_cmd "uci set network.lan.dns='$dns'; uci commit network; /etc/init.d/network restart"
+                success "DNS servers set to: $dns"
+                ;;
+            6) configure_dhcp ;;
+            7)
+                echo "1. Add static route"
+                echo "2. Show routes"
+                echo "3. Delete route"
+                read -p "Select: " rc
+                case $rc in
+                    1)
+                        read -p "Destination network (e.g. 10.0.0.0/24): " dest
+                        read -p "Gateway: " gw
+                        if validate_subnet "$dest" && validate_ip "$gw"; then
+                            local route_name
+                            route_name="route_$(date +%s)"
+                            ssh_cmd "uci set network.$route_name=route; uci set network.$route_name.interface=lan; uci set network.$route_name.target='${dest%/*}'; uci set network.$route_name.netmask='${dest#*/}'; uci set network.$route_name.gateway='$gw'; uci commit network; /etc/init.d/network restart"
+                            success "Static route added"
+                        else
+                            error "Invalid network or gateway"
+                        fi
+                        ;;
+                    2) ssh_cmd "ip route show 2>/dev/null || route -n" ;;
+                    3)
+                        ssh_cmd "uci show network | grep route"
+                        read -p "Route name to delete: " rname
+                        rname=$(sanitize_string "$rname")
+                        ssh_cmd "uci delete network.$rname; uci commit network; /etc/init.d/network restart"
+                        ;;
+                esac
+                ;;
+            8)
+                echo "1. Create VLAN"
+                echo "2. List VLANs"
+                echo "3. Delete VLAN"
+                read -p "Select: " vc
+                case $vc in
+                    1)
+                        read -p "VLAN ID (1-4094): " vid
+                        if validate_int "$vid" 1 4094; then
+                            ssh_cmd "uci set network.vlan${vid}=interface; uci set network.vlan${vid}.proto=static; uci set network.vlan${vid}.type=bridge; uci set network.vlan${vid}.vid=${vid}; uci commit network"
+                            success "VLAN $vid created"
+                            read -p "Set IP for VLAN $vid: " vip
+                            if validate_ip "$vip"; then
+                                ssh_cmd "uci set network.vlan${vid}.ipaddr='$vip'; uci set network.vlan${vid}.netmask='255.255.255.0'; uci commit network; /etc/init.d/network restart"
+                                success "VLAN $vid configured with IP $vip"
+                            fi
+                        else
+                            error "Invalid VLAN ID"
+                        fi
+                        ;;
+                    2) ssh_cmd "uci show network | grep vid" ;;
+                    3)
+                        read -p "VLAN ID to delete: " vid
+                        if validate_int "$vid" 1 4094; then
+                            ssh_cmd "uci delete network.vlan${vid}; uci commit network; /etc/init.d/network restart"
+                            success "VLAN $vid deleted"
+                        fi
+                        ;;
+                esac
+                ;;
+            9)
+                header "Bridge Configuration"
+                ssh_cmd "brctl show 2>/dev/null || ip link show type bridge"
+                echo ""
+                echo "1. Add interface to bridge"
+                echo "2. Remove interface from bridge"
+                echo "3. Enable STP"
+                read -p "Select: " bc
+                case $bc in
+                    1)
+                        read -p "Interface name: " iface
+                        iface=$(sanitize_string "$iface")
+                        ssh_cmd "brctl addif br-lan $iface 2>/dev/null || ip link set $iface master br-lan"
+                        success "Added $iface to bridge"
+                        ;;
+                    2)
+                        read -p "Interface name: " iface
+                        iface=$(sanitize_string "$iface")
+                        ssh_cmd "brctl delif br-lan $iface 2>/dev/null || ip link set $iface nomaster"
+                        success "Removed $iface from bridge"
+                        ;;
+                    3)
+                        ssh_cmd "uci set network.lan.stp=1; uci commit network; /etc/init.d/network restart"
+                        success "STP enabled on bridge"
+                        ;;
+                esac
+                ;;
+            10)
+                read -p "Enter MTU value (68-9000): " mtu
+                if validate_int "$mtu" 68 9000; then
+                    ssh_cmd "uci set network.lan.mtu=$mtu; uci commit network; /etc/init.d/network restart"
+                    success "MTU set to $mtu"
+                else
+                    error "Invalid MTU"
+                fi
+                ;;
+            11)
+                echo "1. Enable NAT (masquerade)"
+                echo "2. Disable NAT"
+                read -p "Select: " nc
+                case $nc in
+                    1) ssh_cmd "uci set firewall.@zone[1].masq=1; uci commit firewall; /etc/init.d/firewall restart"; success "NAT enabled" ;;
+                    2) ssh_cmd "uci set firewall.@zone[1].masq=0; uci commit firewall; /etc/init.d/firewall restart"; success "NAT disabled" ;;
+                esac
+                ;;
+            12)
+                read -p "Enter hostname: " hname
+                hname=$(sanitize_string "$hname")
+                if [[ -n "$hname" ]]; then
+                    ssh_cmd "uci set system.@system[0].hostname='$hname'; uci commit system; /etc/init.d/system restart"
+                    success "Hostname set to $hname"
+                fi
+                ;;
+            13)
+                read -p "Enter timezone (e.g. CET-1CEST,M3.5.0,M10.5.0/3): " tz
+                tz=$(sanitize_string "$tz")
+                ssh_cmd "uci set system.@system[0].timezone='$tz'; uci commit system"
+                success "Timezone set"
+                ;;
+            14) ssh_cmd "ip neigh show 2>/dev/null || arp -a" ;;
+            15) ssh_cmd "ip route show 2>/dev/null || route -n" ;;
+            0) return ;;
+        esac
+
+        echo ""
+        read -p "Press Enter to continue..."
+    done
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 8. DHCP CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
+configure_dhcp() {
+    while true; do
+        header "DHCP Configuration"
+
+        echo "1. Show DHCP config"
+        echo "2. Enable/disable DHCP server"
+        echo "3. Set DHCP range"
+        echo "4. Set lease time"
+        echo "5. Add static lease"
+        echo "6. List static leases"
+        echo "7. Delete static lease"
+        echo "8. Show active leases"
+        echo "0. Back"
+        echo ""
+        read -p "Select option: " choice
+
+        case $choice in
+            1) ssh_cmd "uci show dhcp 2>/dev/null" ;;
+            2)
+                echo "1. Enable DHCP"
+                echo "2. Disable DHCP"
+                read -p "Select: " dc
+                case $dc in
+                    1) ssh_cmd "uci delete dhcp.lan.ignore 2>/dev/null; uci commit dhcp; /etc/init.d/dnsmasq restart"; success "DHCP enabled" ;;
+                    2) ssh_cmd "uci set dhcp.lan.ignore=1; uci commit dhcp; /etc/init.d/dnsmasq restart"; success "DHCP disabled" ;;
+                esac
+                ;;
+            3)
+                read -p "Start IP offset (e.g. 100): " start
+                read -p "Number of IPs (e.g. 50): " limit
+                if validate_int "$start" 2 254 && validate_int "$limit" 1 253; then
+                    ssh_cmd "uci set dhcp.lan.start=$start; uci set dhcp.lan.limit=$limit; uci commit dhcp; /etc/init.d/dnsmasq restart"
+                    success "DHCP range set: offset $start, $limit addresses"
+                else
+                    error "Invalid range"
+                fi
+                ;;
+            4)
+                read -p "Lease time (e.g. 12h, 1d, 30m): " lease
+                lease=$(sanitize_string "$lease")
+                ssh_cmd "uci set dhcp.lan.leasetime='$lease'; uci commit dhcp; /etc/init.d/dnsmasq restart"
+                success "Lease time set to $lease"
+                ;;
+            5)
+                read -p "MAC address (XX:XX:XX:XX:XX:XX): " mac
+                read -p "IP address: " sip
+                read -p "Hostname (optional): " shostname
+                if validate_mac "$mac" && validate_ip "$sip"; then
+                    local lease_name
+                    lease_name="static_$(echo "$mac" | tr ':' '_')"
+                    shostname=$(sanitize_string "$shostname")
+                    ssh_cmd "uci set dhcp.$lease_name=host; uci set dhcp.$lease_name.mac='$mac'; uci set dhcp.$lease_name.ip='$sip'; uci set dhcp.$lease_name.name='$shostname'; uci commit dhcp; /etc/init.d/dnsmasq restart"
+                    success "Static lease added: $mac -> $sip"
+                else
+                    error "Invalid MAC or IP"
+                fi
+                ;;
+            6) ssh_cmd "uci show dhcp | grep host" ;;
+            7)
+                ssh_cmd "uci show dhcp | grep host"
+                read -p "Lease name to delete: " lname
+                lname=$(sanitize_string "$lname")
+                ssh_cmd "uci delete dhcp.$lname; uci commit dhcp; /etc/init.d/dnsmasq restart"
+                success "Lease deleted"
+                ;;
+            8)
+                header "Active DHCP Leases"
+                ssh_cmd "cat /tmp/dhcp.leases 2>/dev/null" || echo "No leases found"
+                ;;
+            0) return ;;
+        esac
+
+        echo ""
+        read -p "Press Enter to continue..."
+    done
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 9. FIREWALL CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
+configure_firewall() {
+    while true; do
+        header "Firewall Configuration"
+
+        echo " 1. Show firewall status"
+        echo " 2. Show current rules"
+        echo " 3. Add port forward"
+        echo " 4. Delete port forward"
+        echo " 5. Add traffic rule (allow/deny)"
+        echo " 6. Delete traffic rule"
+        echo " 7. Block IP address"
+        echo " 8. Unblock IP address"
+        echo " 9. Block MAC address"
+        echo "10. Enable/disable firewall"
+        echo "11. Set zone defaults (input/output/forward)"
+        echo "12. Reset firewall to defaults"
+        echo "13. Show blocked IPs"
+        echo " 0. Back"
+        echo ""
+        read -p "Select option: " choice
+
+        case $choice in
+            1)
+                header "Firewall Status"
+                ssh_cmd "/etc/init.d/firewall status 2>/dev/null"
+                echo ""
+                ssh_cmd "iptables -L -n -v 2>/dev/null | head -40"
+                ;;
+            2) ssh_cmd "uci show firewall 2>/dev/null" ;;
+            3)
+                read -p "Rule name: " pf_name
+                read -p "External port: " ext_port
+                read -p "Internal IP: " int_ip
+                read -p "Internal port: " int_port
+                read -p "Protocol (tcp/udp/tcpudp): " proto
+                pf_name=$(sanitize_string "$pf_name")
+                proto=$(sanitize_string "$proto")
+                if validate_port "$ext_port" && validate_ip "$int_ip" && validate_port "$int_port" && [[ "$proto" =~ ^(tcp|udp|tcpudp)$ ]]; then
+                    ssh_cmd "uci set firewall.$pf_name=redirect; uci set firewall.$pf_name.target=DNAT; uci set firewall.$pf_name.src=wan; uci set firewall.$pf_name.dest=lan; uci set firewall.$pf_name.proto=$proto; uci set firewall.$pf_name.src_dport=$ext_port; uci set firewall.$pf_name.dest_ip=$int_ip; uci set firewall.$pf_name.dest_port=$int_port; uci commit firewall; /etc/init.d/firewall restart"
+                    success "Port forward added: $ext_port -> $int_ip:$int_port ($proto)"
+                else
+                    error "Invalid input"
+                fi
+                ;;
+            4)
+                ssh_cmd "uci show firewall | grep redirect"
+                read -p "Rule name to delete: " rname
+                rname=$(sanitize_string "$rname")
+                ssh_cmd "uci delete firewall.$rname; uci commit firewall; /etc/init.d/firewall restart"
+                success "Port forward deleted"
+                ;;
+            5)
+                read -p "Rule name: " rname
+                echo "Action: 1=ACCEPT  2=DROP  3=REJECT"
+                read -p "Select: " action_c
+                read -p "Source IP (or 'any'): " src_ip
+                read -p "Destination port (or 'any'): " dst_port
+                read -p "Protocol (tcp/udp/tcpudp/icmp): " proto
+                rname=$(sanitize_string "$rname")
+                proto=$(sanitize_string "$proto")
+                local target
+                case $action_c in 1) target="ACCEPT" ;; 2) target="DROP" ;; 3) target="REJECT" ;; *) error "Invalid"; continue ;; esac
+                ssh_cmd "uci set firewall.$rname=rule; uci set firewall.$rname.target=$target; uci set firewall.$rname.proto=$proto; uci set firewall.$rname.src=wan"
+                [[ "$src_ip" != "any" ]] && validate_ip "$src_ip" && ssh_cmd "uci set firewall.$rname.src_ip=$src_ip"
+                [[ "$dst_port" != "any" ]] && validate_port "$dst_port" && ssh_cmd "uci set firewall.$rname.dest_port=$dst_port"
+                ssh_cmd "uci commit firewall; /etc/init.d/firewall restart"
+                success "Traffic rule '$rname' added: $target"
+                ;;
+            6)
+                ssh_cmd "uci show firewall | grep '=rule'"
+                read -p "Rule name to delete: " rname
+                rname=$(sanitize_string "$rname")
+                ssh_cmd "uci delete firewall.$rname; uci commit firewall; /etc/init.d/firewall restart"
+                success "Rule deleted"
+                ;;
+            7)
+                read -p "IP to block: " block_ip
+                if validate_ip "$block_ip"; then
+                    local bname="block_$(echo "$block_ip" | tr '.' '_')"
+                    ssh_cmd "uci set firewall.$bname=rule; uci set firewall.$bname.src=wan; uci set firewall.$bname.src_ip=$block_ip; uci set firewall.$bname.target=DROP; uci set firewall.$bname.proto=all; uci commit firewall; /etc/init.d/firewall restart"
+                    success "IP $block_ip blocked"
+                else
+                    error "Invalid IP"
+                fi
+                ;;
+            8)
+                read -p "IP to unblock: " block_ip
+                if validate_ip "$block_ip"; then
+                    local bname="block_$(echo "$block_ip" | tr '.' '_')"
+                    ssh_cmd "uci delete firewall.$bname 2>/dev/null; uci commit firewall; /etc/init.d/firewall restart"
+                    success "IP $block_ip unblocked"
+                else
+                    error "Invalid IP"
+                fi
+                ;;
+            9)
+                read -p "MAC to block: " block_mac
+                if validate_mac "$block_mac"; then
+                    local bname="blockmac_$(echo "$block_mac" | tr ':' '_')"
+                    ssh_cmd "uci set firewall.$bname=rule; uci set firewall.$bname.src=lan; uci set firewall.$bname.src_mac=$block_mac; uci set firewall.$bname.target=DROP; uci set firewall.$bname.proto=all; uci commit firewall; /etc/init.d/firewall restart"
+                    success "MAC $block_mac blocked"
+                else
+                    error "Invalid MAC"
+                fi
+                ;;
+            10)
+                echo "1. Enable firewall"
+                echo "2. Disable firewall"
+                read -p "Select: " fc
+                case $fc in
+                    1) ssh_cmd "/etc/init.d/firewall enable; /etc/init.d/firewall start"; success "Firewall enabled" ;;
+                    2)
+                        warning "Disabling the firewall exposes the device!"
+                        read -p "Are you sure? (y/N): " confirm
+                        [[ $confirm =~ ^[Yy]$ ]] && ssh_cmd "/etc/init.d/firewall stop; /etc/init.d/firewall disable" && success "Firewall disabled"
+                        ;;
+                esac
+                ;;
+            11)
+                echo "Zone to configure:"
+                echo "1. LAN zone"
+                echo "2. WAN zone"
+                read -p "Select: " zc
+                local zone_idx=$((zc - 1))
+                echo "For each: ACCEPT, DROP, or REJECT"
+                read -p "Input policy: " inp
+                read -p "Output policy: " outp
+                read -p "Forward policy: " fwdp
+                inp=$(echo "$inp" | tr '[:lower:]' '[:upper:]')
+                outp=$(echo "$outp" | tr '[:lower:]' '[:upper:]')
+                fwdp=$(echo "$fwdp" | tr '[:lower:]' '[:upper:]')
+                ssh_cmd "uci set firewall.@zone[$zone_idx].input=$inp; uci set firewall.@zone[$zone_idx].output=$outp; uci set firewall.@zone[$zone_idx].forward=$fwdp; uci commit firewall; /etc/init.d/firewall restart"
+                success "Zone defaults updated"
+                ;;
+            12)
+                warning "This will reset ALL firewall rules!"
+                read -p "Continue? (y/N): " confirm
+                if [[ $confirm =~ ^[Yy]$ ]]; then
+                    ssh_cmd "cp /rom/etc/config/firewall /etc/config/firewall 2>/dev/null; /etc/init.d/firewall restart"
+                    success "Firewall reset to defaults"
+                fi
+                ;;
+            13)
+                header "Blocked IPs"
+                ssh_cmd "uci show firewall | grep -E 'block.*src_ip'"
+                ;;
+            0) return ;;
+        esac
+
+        echo ""
+        read -p "Press Enter to continue..."
+    done
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 10. QoS / TRAFFIC SHAPING
+# ═══════════════════════════════════════════════════════════════════════════════
+configure_qos() {
+    while true; do
+        header "QoS / Traffic Shaping"
+
+        echo "1. Show QoS status"
+        echo "2. Enable/disable QoS"
+        echo "3. Set upload speed limit"
+        echo "4. Set download speed limit"
+        echo "5. Set priority for IP"
+        echo "6. Set priority for port/service"
+        echo "7. Show traffic statistics"
+        echo "8. Rate limit specific IP"
+        echo "0. Back"
+        echo ""
+        read -p "Select option: " choice
+
+        case $choice in
+            1) ssh_cmd "uci show qos 2>/dev/null; echo '---'; tc qdisc show 2>/dev/null" ;;
+            2)
+                echo "1. Enable QoS"
+                echo "2. Disable QoS"
+                read -p "Select: " qc
+                case $qc in
+                    1) ssh_cmd "uci set qos.wan.enabled=1; uci commit qos; /etc/init.d/qos restart 2>/dev/null || /etc/init.d/sqm restart 2>/dev/null"; success "QoS enabled" ;;
+                    2) ssh_cmd "uci set qos.wan.enabled=0; uci commit qos; /etc/init.d/qos stop 2>/dev/null"; success "QoS disabled" ;;
+                esac
+                ;;
+            3)
+                read -p "Upload speed in kbps (e.g. 10000 for 10 Mbps): " upspeed
+                if validate_int "$upspeed" 1 1000000; then
+                    ssh_cmd "uci set qos.wan.upload=$upspeed; uci commit qos; /etc/init.d/qos restart 2>/dev/null"
+                    success "Upload limit set to ${upspeed} kbps"
+                else
+                    error "Invalid speed"
+                fi
+                ;;
+            4)
+                read -p "Download speed in kbps (e.g. 50000 for 50 Mbps): " downspeed
+                if validate_int "$downspeed" 1 1000000; then
+                    ssh_cmd "uci set qos.wan.download=$downspeed; uci commit qos; /etc/init.d/qos restart 2>/dev/null"
+                    success "Download limit set to ${downspeed} kbps"
+                else
+                    error "Invalid speed"
+                fi
+                ;;
+            5)
+                read -p "IP address: " prio_ip
+                read -p "Priority (1=highest, 4=lowest): " prio
+                if validate_ip "$prio_ip" && validate_int "$prio" 1 4; then
+                    local pname="prio_$(echo "$prio_ip" | tr '.' '_')"
+                    local prio_class
+                    case $prio in 1) prio_class="Priority" ;; 2) prio_class="Express" ;; 3) prio_class="Normal" ;; 4) prio_class="Bulk" ;; esac
+                    ssh_cmd "uci set qos.$pname=classify; uci set qos.$pname.target=$prio_class; uci set qos.$pname.src_ip=$prio_ip; uci set qos.$pname.proto=all; uci commit qos; /etc/init.d/qos restart 2>/dev/null"
+                    success "IP $prio_ip set to $prio_class priority"
+                else
+                    error "Invalid input"
+                fi
+                ;;
+            6)
+                read -p "Port number: " qport
+                read -p "Protocol (tcp/udp): " qproto
+                read -p "Priority (1=highest, 4=lowest): " prio
+                qproto=$(sanitize_string "$qproto")
+                if validate_port "$qport" && validate_int "$prio" 1 4; then
+                    local pname="port_${qproto}_${qport}"
+                    local prio_class
+                    case $prio in 1) prio_class="Priority" ;; 2) prio_class="Express" ;; 3) prio_class="Normal" ;; 4) prio_class="Bulk" ;; esac
+                    ssh_cmd "uci set qos.$pname=classify; uci set qos.$pname.target=$prio_class; uci set qos.$pname.dstport=$qport; uci set qos.$pname.proto=$qproto; uci commit qos; /etc/init.d/qos restart 2>/dev/null"
+                    success "Port $qport/$qproto set to $prio_class"
+                fi
+                ;;
+            7)
+                header "Traffic Statistics"
+                ssh_cmd "cat /proc/net/dev"
+                echo ""
+                ssh_cmd "iptables -L -n -v -x 2>/dev/null | head -30"
+                ;;
+            8)
+                read -p "IP to rate-limit: " rl_ip
+                read -p "Max rate in kbps: " rl_rate
+                if validate_ip "$rl_ip" && validate_int "$rl_rate" 1 1000000; then
+                    ssh_cmd "iptables -I FORWARD -s $rl_ip -m limit --limit ${rl_rate}kb/s -j ACCEPT; iptables -A FORWARD -s $rl_ip -j DROP"
+                    success "Rate limit set for $rl_ip: ${rl_rate} kbps"
+                    warning "This is temporary — will reset on reboot"
+                fi
+                ;;
+            0) return ;;
+        esac
+
+        echo ""
+        read -p "Press Enter to continue..."
+    done
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 11. NETWORK TESTING
+# ═══════════════════════════════════════════════════════════════════════════════
+network_test() {
+    while true; do
+        header "Network Testing"
+
+        echo " 1. Ping test (local → PowerBeam)"
+        echo " 2. Ping test (PowerBeam → internet)"
+        echo " 3. Traceroute from PowerBeam"
+        echo " 4. DNS resolution test"
+        echo " 5. Bandwidth test (iperf3)"
+        echo " 6. Latency statistics (50 pings)"
+        echo " 7. MTU path discovery"
+        echo " 8. TCP port check"
+        echo " 9. Signal quality report"
+        echo "10. Packet loss test (100 pings)"
+        echo "11. ARP scan local network"
+        echo " 0. Back"
+        echo ""
+        read -p "Select option: " choice
+
+        case $choice in
+            1)
+                header "Ping Test"
+                ping -c 10 -i 0.5 "$POWERBEAM_IP"
+                ;;
+            2)
+                read -p "Target IP/hostname (default 8.8.8.8): " target
+                target="${target:-8.8.8.8}"
+                target=$(sanitize_string "$target")
+                header "Ping from PowerBeam to $target"
+                ssh_cmd "ping -c 10 -i 0.5 $target" || error "Ping failed"
+                ;;
+            3)
+                read -p "Target (default 8.8.8.8): " target
+                target="${target:-8.8.8.8}"
+                target=$(sanitize_string "$target")
+                header "Traceroute from PowerBeam"
+                ssh_cmd "traceroute $target 2>/dev/null || traceroute -n $target" || error "Traceroute failed"
+                ;;
+            4)
+                header "DNS Test"
+                ssh_cmd "nslookup google.com 2>/dev/null; echo '---'; nslookup github.com 2>/dev/null" || error "DNS test failed"
+                ;;
+            5)
+                header "Bandwidth Test (iperf3)"
+                echo "1. Run iperf3 server on PowerBeam"
+                echo "2. Run iperf3 client to PowerBeam"
+                echo "3. Full duplex test"
+                read -p "Select: " ic
+                case $ic in
+                    1)
+                        ssh_cmd "killall iperf3 2>/dev/null; iperf3 -s -D"
+                        success "iperf3 server started on PowerBeam"
+                        echo "Connect from any device: iperf3 -c $POWERBEAM_IP"
+                        ;;
+                    2)
+                        ssh_cmd "killall iperf3 2>/dev/null; iperf3 -s -D" &
+                        sleep 2
+                        iperf3 -c "$POWERBEAM_IP" -t 10
+                        ssh_cmd "killall iperf3 2>/dev/null"
+                        ;;
+                    3)
+                        ssh_cmd "killall iperf3 2>/dev/null; iperf3 -s -D" &
+                        sleep 2
+                        iperf3 -c "$POWERBEAM_IP" -t 10 -d
+                        ssh_cmd "killall iperf3 2>/dev/null"
+                        ;;
+                esac
+                ;;
+            6)
+                header "Latency Statistics (50 pings)"
+                ping -c 50 -i 0.2 "$POWERBEAM_IP" | tail -5
+                ;;
+            7)
+                header "MTU Path Discovery"
+                for mtu in 1500 1492 1472 1400 1300 1200; do
+                    if ping -c 1 -M do -s $mtu "$POWERBEAM_IP" &>/dev/null; then
+                        success "MTU $((mtu + 28)) works (payload $mtu)"
+                        break
+                    else
+                        echo "MTU $((mtu + 28)) too large"
+                    fi
+                done
+                ;;
+            8)
+                read -p "Port to check: " port
+                if validate_port "$port"; then
+                    timeout 3 bash -c "echo >/dev/tcp/$POWERBEAM_IP/$port" 2>/dev/null && success "Port $port is OPEN" || error "Port $port is CLOSED"
+                fi
+                ;;
+            9)
+                header "Signal Quality Report"
+                ssh_cmd "iwinfo wlan0 info 2>/dev/null"
+                echo ""
+                ssh_cmd "iwinfo wlan0 assoclist 2>/dev/null"
+                echo ""
+                ssh_cmd "cat /proc/net/wireless 2>/dev/null"
+                ;;
+            10)
+                header "Packet Loss Test (100 pings)"
+                ping -c 100 -i 0.1 "$POWERBEAM_IP" | tail -3
+                ;;
+            11)
+                header "ARP Scan"
+                ssh_cmd "ip neigh show 2>/dev/null || arp -a"
+                ;;
+            0) return ;;
+        esac
+
+        echo ""
+        read -p "Press Enter to continue..."
+    done
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 12. FIRMWARE MANAGEMENT
+# ═══════════════════════════════════════════════════════════════════════════════
+firmware_management() {
+    while true; do
+        header "Firmware Management"
+
+        echo "1. Show current firmware version"
+        echo "2. Show available space"
+        echo "3. Backup current firmware"
+        echo "4. Upload & flash firmware"
+        echo "5. Reset to factory defaults"
+        echo "6. Install package (opkg)"
+        echo "7. Remove package"
+        echo "8. List installed packages"
+        echo "9. Update package lists"
+        echo "0. Back"
+        echo ""
+        read -p "Select option: " choice
+
+        case $choice in
+            1)
+                header "Firmware Version"
+                ssh_cmd "cat /etc/openwrt_version 2>/dev/null; echo ''; cat /etc/openwrt_release 2>/dev/null"
+                ;;
+            2)
+                header "Storage"
+                ssh_cmd "df -h"
+                echo ""
+                ssh_cmd "du -sh /overlay/* 2>/dev/null"
+                ;;
+            3)
+                mkdir -p "$BACKUP_DIR"
+                local fw_file="$BACKUP_DIR/firmware_backup_$(date +%Y%m%d_%H%M%S).bin"
+                log "Backing up firmware (this may take a while)..."
+                ssh_cmd "dd if=/dev/mtd0 2>/dev/null" > "$fw_file"
+                if [[ -s "$fw_file" ]]; then
+                    success "Firmware backed up to $fw_file ($(du -h "$fw_file" | cut -f1))"
+                else
+                    error "Firmware backup failed"
+                    rm -f "$fw_file"
+                fi
+                ;;
+            4)
+                warning "Firmware flashing can BRICK your device!"
+                warning "Make sure you have the correct firmware for PowerBeam M5 400 UX"
+                echo ""
+                read -p "Local firmware file path: " fw_path
+                if [[ -f "$fw_path" ]]; then
+                    local fw_size
+                    fw_size=$(du -h "$fw_path" | cut -f1)
+                    read -p "Flash $fw_path ($fw_size)? Keep settings? (y/N): " keep
+                    read -p "FINAL CONFIRMATION — type 'FLASH' to proceed: " confirm
+                    if [[ "$confirm" == "FLASH" ]]; then
+                        scp_to "$fw_path" "/tmp/firmware.bin"
+                        if [[ $keep =~ ^[Yy]$ ]]; then
+                            ssh_cmd "sysupgrade -v /tmp/firmware.bin"
+                        else
+                            ssh_cmd "sysupgrade -n -v /tmp/firmware.bin"
+                        fi
+                        warning "Device is flashing — do NOT disconnect power!"
+                        success "Waiting for reboot..."
+                        sleep 60
+                        check_connection
+                    fi
+                else
+                    error "File not found: $fw_path"
+                fi
+                ;;
+            5)
+                warning "This will ERASE all configuration!"
+                read -p "Type 'RESET' to confirm: " confirm
+                if [[ "$confirm" == "RESET" ]]; then
+                    ssh_cmd "firstboot -y && reboot"
+                    warning "Device resetting — will reboot with defaults"
+                fi
+                ;;
+            6)
+                read -p "Package name to install: " pkg
+                pkg=$(sanitize_string "$pkg")
+                ssh_cmd "opkg install $pkg"
+                ;;
+            7)
+                read -p "Package name to remove: " pkg
+                pkg=$(sanitize_string "$pkg")
+                ssh_cmd "opkg remove $pkg"
+                ;;
+            8) ssh_cmd "opkg list-installed" ;;
+            9)
+                log "Updating package lists..."
+                ssh_cmd "opkg update"
+                success "Package lists updated"
+                ;;
+            0) return ;;
+        esac
+
+        echo ""
+        read -p "Press Enter to continue..."
+    done
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 13. BACKUP & RESTORE
+# ═══════════════════════════════════════════════════════════════════════════════
+backup_restore() {
+    while true; do
+        header "Backup & Restore"
+
+        mkdir -p "$BACKUP_DIR"
+
+        echo "Backup directory: $BACKUP_DIR"
+        echo ""
+        echo "1. Full configuration backup"
+        echo "2. Restore configuration"
+        echo "3. Export single config (network/wireless/firewall/dhcp)"
+        echo "4. Import single config"
+        echo "5. List backups"
+        echo "6. Quick diff: current vs backup"
+        echo "0. Back"
+        echo ""
+        read -p "Select option: " choice
+
+        case $choice in
+            1)
+                local backup_file="$BACKUP_DIR/config_$(date +%Y%m%d_%H%M%S).tar.gz"
+                log "Creating full configuration backup..."
+                ssh_cmd "tar czf /tmp/backup.tar.gz /etc/config/ 2>/dev/null"
+                scp_from "/tmp/backup.tar.gz" "$backup_file"
+                ssh_cmd "rm -f /tmp/backup.tar.gz"
+                if [[ -s "$backup_file" ]]; then
+                    success "Backup saved: $backup_file ($(du -h "$backup_file" | cut -f1))"
+                else
+                    error "Backup failed"
+                fi
+                ;;
+            2)
+                echo "Available backups:"
+                ls -lh "$BACKUP_DIR"/config_*.tar.gz 2>/dev/null || echo "No backups found"
+                echo ""
+                read -p "Backup file to restore: " restore_file
+                if [[ -f "$restore_file" ]]; then
+                    warning "This will overwrite current configuration!"
+                    read -p "Continue? (y/N): " confirm
+                    if [[ $confirm =~ ^[Yy]$ ]]; then
+                        scp_to "$restore_file" "/tmp/backup.tar.gz"
+                        ssh_cmd "cd / && tar xzf /tmp/backup.tar.gz && rm /tmp/backup.tar.gz && reboot"
+                        success "Configuration restored — device rebooting"
+                    fi
+                else
+                    error "File not found"
+                fi
+                ;;
+            3)
+                echo "Export which config?"
+                echo "1. network  2. wireless  3. firewall  4. dhcp  5. system"
+                read -p "Select: " ec
+                local config_name
+                case $ec in 1) config_name="network" ;; 2) config_name="wireless" ;; 3) config_name="firewall" ;; 4) config_name="dhcp" ;; 5) config_name="system" ;; *) continue ;; esac
+                local export_file="$BACKUP_DIR/${config_name}_$(date +%Y%m%d_%H%M%S).conf"
+                scp_from "/etc/config/$config_name" "$export_file"
+                success "Exported to $export_file"
+                ;;
+            4)
+                read -p "Config file to import: " import_file
+                if [[ -f "$import_file" ]]; then
+                    local config_name
+                    config_name=$(basename "$import_file" | sed 's/_[0-9].*$//')
+                    scp_to "$import_file" "/etc/config/$config_name"
+                    ssh_cmd "/etc/init.d/$config_name restart 2>/dev/null || /etc/init.d/network restart"
+                    success "Config imported and applied"
+                else
+                    error "File not found"
+                fi
+                ;;
+            5)
+                header "Available Backups"
+                ls -lh "$BACKUP_DIR"/ 2>/dev/null || echo "No backups"
+                ;;
+            6)
+                echo "Available backups:"
+                ls "$BACKUP_DIR"/config_*.tar.gz 2>/dev/null
+                read -p "Backup file to compare: " cmp_file
+                if [[ -f "$cmp_file" ]]; then
+                    local tmp_dir
+                    tmp_dir=$(mktemp -d)
+                    tar xzf "$cmp_file" -C "$tmp_dir" 2>/dev/null
+                    for conf in network wireless firewall dhcp system; do
+                        if [[ -f "$tmp_dir/etc/config/$conf" ]]; then
+                            local current
+                            current=$(ssh_cmd "cat /etc/config/$conf 2>/dev/null")
+                            echo "=== $conf ==="
+                            diff <(echo "$current") "$tmp_dir/etc/config/$conf" 2>/dev/null || echo "No differences"
+                            echo ""
+                        fi
+                    done
+                    rm -rf "$tmp_dir"
+                fi
+                ;;
+            0) return ;;
+        esac
+
+        echo ""
+        read -p "Press Enter to continue..."
+    done
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 14. LOGGING & DIAGNOSTICS
+# ═══════════════════════════════════════════════════════════════════════════════
+logging_diagnostics() {
+    while true; do
+        header "Logging & Diagnostics"
+
+        echo " 1. System log (logread)"
+        echo " 2. Kernel log (dmesg)"
+        echo " 3. Live log monitoring"
+        echo " 4. Wireless events log"
+        echo " 5. DHCP log"
+        echo " 6. Firewall log"
+        echo " 7. Connection history"
+        echo " 8. Enable remote syslog"
+        echo " 9. Download full log"
+        echo "10. Clear logs"
+        echo "11. Show link uptime history"
+        echo " 0. Back"
+        echo ""
+        read -p "Select option: " choice
+
+        case $choice in
+            1) ssh_cmd "logread 2>/dev/null | tail -50" ;;
+            2) ssh_cmd "dmesg | tail -50" ;;
+            3)
+                log "Live log monitoring... (Ctrl+C to stop)"
+                trap 'echo ""; return' INT
+                ssh_cmd "logread -f" 30
+                trap - INT
+                ;;
+            4) ssh_cmd "logread 2>/dev/null | grep -i -E '(wireless|wifi|wlan|ieee80211|hostapd)' | tail -30" ;;
+            5) ssh_cmd "logread 2>/dev/null | grep -i -E '(dhcp|dnsmasq)' | tail -30" ;;
+            6) ssh_cmd "logread 2>/dev/null | grep -i -E '(firewall|iptables|DROP|REJECT)' | tail -30" ;;
+            7) ssh_cmd "logread 2>/dev/null | grep -i -E '(assoc|disassoc|auth|deauth|connect)' | tail -30" ;;
+            8)
+                read -p "Remote syslog server IP: " syslog_ip
+                if validate_ip "$syslog_ip"; then
+                    read -p "Port (default 514): " syslog_port
+                    syslog_port="${syslog_port:-514}"
+                    ssh_cmd "uci set system.@system[0].log_ip='$syslog_ip'; uci set system.@system[0].log_port='$syslog_port'; uci set system.@system[0].log_proto='udp'; uci commit system; /etc/init.d/log restart"
+                    success "Remote syslog configured: $syslog_ip:$syslog_port"
+                fi
+                ;;
+            9)
+                mkdir -p "$BACKUP_DIR"
+                local log_file="$BACKUP_DIR/syslog_$(date +%Y%m%d_%H%M%S).txt"
+                ssh_cmd "logread 2>/dev/null" > "$log_file"
+                success "Log saved to $log_file"
+                ;;
+            10)
+                ssh_cmd "logread -e '' > /dev/null 2>&1; echo '' > /var/log/messages 2>/dev/null"
+                success "Logs cleared"
+                ;;
+            11)
+                header "Link Uptime"
+                ssh_cmd "uptime"
+                echo ""
+                ssh_cmd "logread 2>/dev/null | grep -i -E '(link up|link down|carrier)' | tail -20"
+                ;;
+            0) return ;;
+        esac
+
+        echo ""
+        read -p "Press Enter to continue..."
+    done
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 15. SCHEDULED TASKS (CRON)
+# ═══════════════════════════════════════════════════════════════════════════════
+manage_cron() {
+    while true; do
+        header "Scheduled Tasks (Cron)"
+
+        echo "1. Show current cron jobs"
+        echo "2. Add auto-reboot schedule"
+        echo "3. Add wifi restart schedule"
+        echo "4. Add watchdog (auto-reconnect)"
+        echo "5. Add custom cron job"
+        echo "6. Delete cron job"
+        echo "7. Enable/disable cron"
+        echo "0. Back"
+        echo ""
+        read -p "Select option: " choice
+
+        case $choice in
+            1) ssh_cmd "crontab -l 2>/dev/null" || echo "No cron jobs" ;;
+            2)
+                echo "Reboot schedule:"
+                echo "1. Daily at 4:00 AM"
+                echo "2. Weekly (Sunday 4:00 AM)"
+                echo "3. Monthly (1st day, 4:00 AM)"
+                echo "4. Custom"
+                read -p "Select: " rc
+                local cron_time
+                case $rc in
+                    1) cron_time="0 4 * * *" ;;
+                    2) cron_time="0 4 * * 0" ;;
+                    3) cron_time="0 4 1 * *" ;;
+                    4) read -p "Cron expression (min hour dom mon dow): " cron_time; cron_time=$(sanitize_string "$cron_time") ;;
+                esac
+                ssh_cmd "(crontab -l 2>/dev/null; echo '$cron_time reboot') | sort -u | crontab -"
+                success "Auto-reboot scheduled: $cron_time"
+                ;;
+            3)
+                read -p "Restart wifi every N hours (1-24): " hours
+                if validate_int "$hours" 1 24; then
+                    ssh_cmd "(crontab -l 2>/dev/null; echo '0 */$hours * * * wifi reload') | sort -u | crontab -"
+                    success "WiFi restart scheduled every $hours hours"
+                fi
+                ;;
+            4)
+                read -p "Target IP to monitor (gateway): " watchdog_ip
+                if validate_ip "$watchdog_ip"; then
+                    local watchdog_script='#!/bin/sh
+if ! ping -c 3 -W 5 '"$watchdog_ip"' >/dev/null 2>&1; then
+    logger "Watchdog: connection lost, restarting wifi"
+    wifi reload
+    sleep 10
+    if ! ping -c 3 -W 5 '"$watchdog_ip"' >/dev/null 2>&1; then
+        logger "Watchdog: wifi restart failed, rebooting"
+        reboot
+    fi
+fi'
+                    ssh_cmd "cat > /usr/bin/watchdog.sh << 'WATCHEOF'
+$watchdog_script
+WATCHEOF
+chmod +x /usr/bin/watchdog.sh"
+                    ssh_cmd "(crontab -l 2>/dev/null; echo '*/5 * * * * /usr/bin/watchdog.sh') | sort -u | crontab -"
+                    success "Watchdog installed — checks every 5 minutes, restarts wifi or reboots if link is down"
+                fi
+                ;;
+            5)
+                read -p "Cron expression (e.g. '0 */6 * * *'): " cron_expr
+                read -p "Command to run: " cron_cmd
+                cron_expr=$(sanitize_string "$cron_expr")
+                cron_cmd=$(sanitize_string "$cron_cmd")
+                ssh_cmd "(crontab -l 2>/dev/null; echo '$cron_expr $cron_cmd') | sort -u | crontab -"
+                success "Cron job added"
+                ;;
+            6)
+                header "Current Jobs"
+                ssh_cmd "crontab -l 2>/dev/null"
+                echo ""
+                read -p "Enter exact line to remove: " line
+                line=$(sanitize_string "$line")
+                ssh_cmd "crontab -l 2>/dev/null | grep -vF '$line' | crontab -"
+                success "Job removed"
+                ;;
+            7)
+                echo "1. Enable cron"
+                echo "2. Disable cron"
+                read -p "Select: " cc
+                case $cc in
+                    1) ssh_cmd "/etc/init.d/cron enable; /etc/init.d/cron start"; success "Cron enabled" ;;
+                    2) ssh_cmd "/etc/init.d/cron stop; /etc/init.d/cron disable"; success "Cron disabled" ;;
+                esac
+                ;;
+            0) return ;;
+        esac
+
+        echo ""
+        read -p "Press Enter to continue..."
+    done
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 16. LED MANAGEMENT
+# ═══════════════════════════════════════════════════════════════════════════════
+manage_leds() {
+    while true; do
+        header "LED Management"
+
+        echo "1. Show LED status"
+        echo "2. Show LED config"
+        echo "3. Turn all LEDs off"
+        echo "4. Turn all LEDs on"
+        echo "5. Set LED to signal strength indicator"
+        echo "6. Set LED blink pattern"
+        echo "0. Back"
+        echo ""
+        read -p "Select option: " choice
+
+        case $choice in
+            1) ssh_cmd "ls /sys/class/leds/ 2>/dev/null; echo '---'; for led in /sys/class/leds/*/brightness; do echo \"\$led: \$(cat \$led)\"; done 2>/dev/null" ;;
+            2) ssh_cmd "uci show system | grep led" ;;
+            3)
+                ssh_cmd "for led in /sys/class/leds/*/brightness; do echo 0 > \$led; done 2>/dev/null"
+                success "All LEDs off"
+                ;;
+            4)
+                ssh_cmd "for led in /sys/class/leds/*/brightness; do echo 255 > \$led; done 2>/dev/null"
+                success "All LEDs on"
+                ;;
+            5)
+                ssh_cmd "ls /sys/class/leds/"
+                read -p "LED name: " led_name
+                led_name=$(sanitize_string "$led_name")
+                ssh_cmd "uci set system.rssi_led=led; uci set system.rssi_led.name='RSSI'; uci set system.rssi_led.sysfs='$led_name'; uci set system.rssi_led.trigger='netdev'; uci set system.rssi_led.dev='wlan0'; uci set system.rssi_led.mode='link'; uci commit system; /etc/init.d/led restart"
+                success "LED set as signal indicator"
+                ;;
+            6)
+                ssh_cmd "ls /sys/class/leds/"
+                read -p "LED name: " led_name
+                read -p "Delay on (ms): " delay_on
+                read -p "Delay off (ms): " delay_off
+                led_name=$(sanitize_string "$led_name")
+                ssh_cmd "echo timer > /sys/class/leds/$led_name/trigger; echo $delay_on > /sys/class/leds/$led_name/delay_on; echo $delay_off > /sys/class/leds/$led_name/delay_off"
+                success "LED blink pattern set"
+                ;;
+            0) return ;;
+        esac
+
+        echo ""
+        read -p "Press Enter to continue..."
+    done
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 17. MAC ADDRESS MANAGEMENT
+# ═══════════════════════════════════════════════════════════════════════════════
+manage_mac() {
+    while true; do
+        header "MAC Address Management"
+
+        echo "1. Show current MAC addresses"
+        echo "2. Change wireless MAC (spoof)"
+        echo "3. Change LAN MAC (spoof)"
+        echo "4. Randomize wireless MAC"
+        echo "5. Restore original MAC"
+        echo "6. MAC whitelist (allow only)"
+        echo "7. Show MAC filter list"
+        echo "8. Clear MAC filter"
+        echo "0. Back"
+        echo ""
+        read -p "Select option: " choice
+
+        case $choice in
+            1)
+                ssh_cmd "ip link show 2>/dev/null | grep -E '(link/ether|wlan|eth|br-)'"
+                ;;
+            2)
+                read -p "New MAC address (XX:XX:XX:XX:XX:XX): " new_mac
+                if validate_mac "$new_mac"; then
+                    ssh_cmd "uci set wireless.@wifi-iface[0].macaddr='$new_mac'; uci commit wireless; wifi reload"
+                    success "Wireless MAC changed to $new_mac"
+                else
+                    error "Invalid MAC address"
+                fi
+                ;;
+            3)
+                read -p "New LAN MAC address: " new_mac
+                if validate_mac "$new_mac"; then
+                    ssh_cmd "uci set network.lan.macaddr='$new_mac'; uci commit network; /etc/init.d/network restart"
+                    success "LAN MAC changed to $new_mac"
+                fi
+                ;;
+            4)
+                local rand_mac
+                rand_mac=$(printf '02:%02x:%02x:%02x:%02x:%02x' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)))
+                ssh_cmd "uci set wireless.@wifi-iface[0].macaddr='$rand_mac'; uci commit wireless; wifi reload"
+                success "Wireless MAC randomized to $rand_mac"
+                ;;
+            5)
+                ssh_cmd "uci delete wireless.@wifi-iface[0].macaddr 2>/dev/null; uci delete network.lan.macaddr 2>/dev/null; uci commit; wifi reload; /etc/init.d/network restart"
+                success "MAC addresses restored to hardware defaults"
+                ;;
+            6)
+                echo "MAC whitelist — only these MACs can connect"
+                read -p "MAC address to whitelist: " wl_mac
+                if validate_mac "$wl_mac"; then
+                    ssh_cmd "uci set wireless.@wifi-iface[0].macfilter='allow'; uci add_list wireless.@wifi-iface[0].maclist='$wl_mac'; uci commit wireless; wifi reload"
+                    success "MAC $wl_mac whitelisted"
+                fi
+                ;;
+            7) ssh_cmd "uci show wireless | grep maclist" ;;
+            8)
+                ssh_cmd "uci delete wireless.@wifi-iface[0].macfilter 2>/dev/null; uci delete wireless.@wifi-iface[0].maclist 2>/dev/null; uci commit wireless; wifi reload"
+                success "MAC filter cleared"
+                ;;
+            0) return ;;
+        esac
+
+        echo ""
+        read -p "Press Enter to continue..."
+    done
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 18. SECURITY HARDENING
+# ═══════════════════════════════════════════════════════════════════════════════
+security_hardening() {
+    while true; do
+        header "Security Hardening"
+
+        echo " 1. Change root password"
+        echo " 2. Add SSH authorized key"
+        echo " 3. Disable password SSH (key-only)"
+        echo " 4. Change SSH port"
+        echo " 5. Disable SSH on WAN"
+        echo " 6. Disable telnet"
+        echo " 7. Disable LuCI (web interface) on WAN"
+        echo " 8. Enable HTTPS-only for LuCI"
+        echo " 9. Show open ports"
+        echo "10. Security audit"
+        echo " 0. Back"
+        echo ""
+        read -p "Select option: " choice
+
+        case $choice in
+            1)
+                read -sp "New root password: " pass1; echo ""
+                read -sp "Confirm password: " pass2; echo ""
+                if [[ "$pass1" == "$pass2" && ${#pass1} -ge 6 ]]; then
+                    pass1=$(sanitize_string "$pass1")
+                    ssh_cmd "echo -e '$pass1\n$pass1' | passwd root"
+                    success "Root password changed"
+                else
+                    error "Passwords don't match or too short (min 6 chars)"
+                fi
+                ;;
+            2)
+                read -p "Public key file path (or paste key): " key_input
+                local pub_key
+                if [[ -f "$key_input" ]]; then
+                    pub_key=$(cat "$key_input")
+                else
+                    pub_key="$key_input"
+                fi
+                if [[ "$pub_key" == ssh-* ]]; then
+                    ssh_cmd "echo '$pub_key' >> /etc/dropbear/authorized_keys"
+                    success "SSH key added"
+                else
+                    error "Invalid SSH public key"
+                fi
+                ;;
+            3)
+                warning "Make sure you have an SSH key configured first!"
+                read -p "Continue? (y/N): " confirm
+                if [[ $confirm =~ ^[Yy]$ ]]; then
+                    ssh_cmd "uci set dropbear.@dropbear[0].PasswordAuth=0; uci set dropbear.@dropbear[0].RootPasswordAuth=0; uci commit dropbear; /etc/init.d/dropbear restart"
+                    success "Password authentication disabled"
+                fi
+                ;;
+            4)
+                read -p "New SSH port: " new_port
+                if validate_port "$new_port"; then
+                    ssh_cmd "uci set dropbear.@dropbear[0].Port=$new_port; uci commit dropbear; /etc/init.d/dropbear restart"
+                    success "SSH port changed to $new_port"
+                    warning "Use 'ssh -p $new_port root@$POWERBEAM_IP' from now on"
+                fi
+                ;;
+            5)
+                ssh_cmd "uci set dropbear.@dropbear[0].Interface='lan'; uci commit dropbear; /etc/init.d/dropbear restart"
+                success "SSH restricted to LAN only"
+                ;;
+            6)
+                ssh_cmd "/etc/init.d/telnet stop 2>/dev/null; /etc/init.d/telnet disable 2>/dev/null; uci set system.@system[0].ttylogin=1 2>/dev/null; uci commit system"
+                success "Telnet disabled"
+                ;;
+            7)
+                ssh_cmd "uci delete uhttpd.main.listen_http_wan 2>/dev/null; uci delete uhttpd.main.listen_https_wan 2>/dev/null; uci commit uhttpd; /etc/init.d/uhttpd restart"
+                success "LuCI disabled on WAN"
+                ;;
+            8)
+                ssh_cmd "uci set uhttpd.main.redirect_https=1; uci commit uhttpd; /etc/init.d/uhttpd restart"
+                success "HTTPS redirect enabled for LuCI"
+                ;;
+            9)
+                header "Open Ports"
+                ssh_cmd "netstat -tuln 2>/dev/null"
+                ;;
+            10)
+                header "Security Audit"
+                echo -e "${CYAN}Checking security configuration...${NC}"
+                echo ""
+
+                local ssh_port
+                ssh_port=$(ssh_cmd "uci get dropbear.@dropbear[0].Port 2>/dev/null")
+                [[ "$ssh_port" == "22" ]] && warning "SSH on default port 22" || success "SSH on non-default port: $ssh_port"
+
+                local pw_auth
+                pw_auth=$(ssh_cmd "uci get dropbear.@dropbear[0].PasswordAuth 2>/dev/null")
+                [[ "$pw_auth" == "0" ]] && success "Password auth disabled" || warning "Password auth enabled — consider key-only"
+
+                local fw_status
+                fw_status=$(ssh_cmd "/etc/init.d/firewall status 2>/dev/null")
+                echo "$fw_status" | grep -q "running" && success "Firewall is running" || warning "Firewall may not be running"
+
+                ssh_cmd "netstat -tuln 2>/dev/null | grep :23" && warning "Telnet port 23 is OPEN" || success "Telnet is not running"
+
+                local enc
+                enc=$(ssh_cmd "uci get wireless.@wifi-iface[0].encryption 2>/dev/null")
+                [[ "$enc" == "none" ]] && warning "WiFi encryption is NONE (open network!)" || success "WiFi encryption: $enc"
+
+                local hidden
+                hidden=$(ssh_cmd "uci get wireless.@wifi-iface[0].hidden 2>/dev/null")
+                [[ "$hidden" == "1" ]] && success "SSID is hidden" || info "SSID is visible (not hidden)"
+
+                echo ""
+                ;;
+            0) return ;;
+        esac
+
+        echo ""
+        read -p "Press Enter to continue..."
+    done
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 19. SERVICES MANAGEMENT
+# ═══════════════════════════════════════════════════════════════════════════════
+manage_services() {
+    while true; do
+        header "Services Management"
+
+        echo "1. List all services"
+        echo "2. Start service"
+        echo "3. Stop service"
+        echo "4. Restart service"
+        echo "5. Enable service at boot"
+        echo "6. Disable service at boot"
+        echo "7. Show service status"
+        echo "0. Back"
+        echo ""
+        read -p "Select option: " choice
+
+        case $choice in
+            1) ssh_cmd "ls /etc/init.d/" ;;
+            2)
+                read -p "Service name: " svc
+                svc=$(sanitize_string "$svc")
+                ssh_cmd "/etc/init.d/$svc start" && success "$svc started" || error "Failed to start $svc"
+                ;;
+            3)
+                read -p "Service name: " svc
+                svc=$(sanitize_string "$svc")
+                ssh_cmd "/etc/init.d/$svc stop" && success "$svc stopped" || error "Failed to stop $svc"
+                ;;
+            4)
+                read -p "Service name: " svc
+                svc=$(sanitize_string "$svc")
+                ssh_cmd "/etc/init.d/$svc restart" && success "$svc restarted" || error "Failed to restart $svc"
+                ;;
+            5)
+                read -p "Service name: " svc
+                svc=$(sanitize_string "$svc")
+                ssh_cmd "/etc/init.d/$svc enable" && success "$svc enabled" || error "Failed to enable $svc"
+                ;;
+            6)
+                read -p "Service name: " svc
+                svc=$(sanitize_string "$svc")
+                ssh_cmd "/etc/init.d/$svc disable" && success "$svc disabled" || error "Failed to disable $svc"
+                ;;
+            7)
+                read -p "Service name: " svc
+                svc=$(sanitize_string "$svc")
+                ssh_cmd "/etc/init.d/$svc status 2>/dev/null; ps w | grep $svc"
+                ;;
+            0) return ;;
+        esac
+
+        echo ""
+        read -p "Press Enter to continue..."
+    done
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 20. MAIN MENU
+# ═══════════════════════════════════════════════════════════════════════════════
+show_menu() {
+    clear 2>/dev/null
+    echo ""
+    echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}║${WHITE}          PowerBeam M5 400 UX Management Tool v1.1        ${GREEN}║${NC}"
+    echo -e "${GREEN}║${WHITE}              OpenWRT Edition - With WiFi Client!         ${GREEN}║${NC}"
+    echo -e "${GREEN}║${GRAY}              Copyright © 2026 E.B.G                       ${GREEN}║${NC}"
+    echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e " ${WHITE}Target:${NC} $POWERBEAM_IP  ${WHITE}Band:${NC} $PB_FREQ_BAND  ${WHITE}User:${NC} $SSH_USER"
+    echo ""
+    echo -e " ${CYAN}── WIRELESS ──${NC}"
+    echo "  1. Wireless Configuration (AP mode - all options)"
+    echo "  2. WiFi Client Mode (connect to external AP) ⭐ NEW"
+    echo "  3. Antenna Alignment"
+    echo "  4. Monitor Mode & Packet Capture"
+    echo "  5. Scan Networks (simple)"
+    echo ""
+    echo -e " ${CYAN}── NETWORK ──${NC}"
+    echo "  6. Network Configuration"
+    echo "  7. DHCP Configuration"
+    echo "  8. Firewall Configuration"
+    echo "  9. QoS / Traffic Shaping"
+    echo " 10. Network Testing"
+    echo ""
+    echo -e " ${CYAN}── SYSTEM ──${NC}"
+    echo " 11. System Information"
+    echo " 12. Firmware & Packages"
+    echo " 13. Backup & Restore"
+    echo " 14. Scheduled Tasks (Cron)"
+    echo " 15. Services Management"
+    echo " 16. Logging & Diagnostics"
+    echo ""
+    echo -e " ${CYAN}── HARDWARE ──${NC}"
+    echo " 17. LED Management"
+    echo " 18. GPIO / Hardware Control"
+    echo " 19. MAC Address Management"
+    echo ""
+    echo -e " ${CYAN}── SECURITY ──${NC}"
+    echo " 20. Security Hardening"
+    echo ""
+    echo -e " ${CYAN}── ACCESS ──${NC}"
+    echo " 21. SSH Terminal"
+    echo " 22. Reboot Device"
+    echo " 23. Change Target IP"
+    echo ""
+    echo "  0. Exit"
+    echo ""
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN LOOP
+# ═══════════════════════════════════════════════════════════════════════════════
+main() {
+    mkdir -p "$BACKUP_DIR" 2>/dev/null
+
+    echo ""
+    echo -e "${GREEN}╔════════════════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}║${WHITE}    PowerBeam Manager v1.1                        ${GREEN}║${NC}"
+    echo -e "${GREEN}║${WHITE}              Initializing connection...            ${GREEN}║${NC}"
+    echo -e "${GREEN}╚════════════════════════════════════════════════════╝${NC}"
+    echo ""
+
+    # Detect active ethernet interface
+    local detected_iface
+    detected_iface=$(detect_interface)
+    if [[ -n "$detected_iface" ]]; then
+        INTERFACE="$detected_iface"
+        info "Ethernet interface detected: $INTERFACE"
+    fi
+
+    # Intentar conexión inicial (silencioso)
+    if check_connection 2>/dev/null; then
+        success "SSH connection established — PowerBeam ready!"
+    else
+        warning "SSH connection failed — some features will not work"
+        warning "Use option 23 to set the correct IP address"
+    fi
+
+    # MENÚ PRINCIPAL
+    while true; do
+        show_menu
+        read -p " Select option: " choice
+
+        case $choice in
+            1)  configure_wireless ;;
+            2)  configure_wifi_client ;;
+            3)  antenna_alignment ;;
+            4)  monitor_mode ;;
+            5)  wireless_scan ;;
+            6)  configure_network ;;
+            7)  configure_dhcp ;;
+            8)  configure_firewall ;;
+            9)  configure_qos ;;
+            10) network_test ;;
+            11) get_system_info ;;
+            12) firmware_management ;;
+            13) backup_restore ;;
+            14) manage_cron ;;
+            15) manage_services ;;
+            16) logging_diagnostics ;;
+            17) manage_leds ;;
+            18) hardware_control ;;
+            19) manage_mac ;;
+            20) security_hardening ;;
+            21)
+                log "Opening SSH terminal..."
+                local ssh_opts="-o StrictHostKeyChecking=no"
+                [[ -n "$SSH_KEY" ]] && ssh_opts="$ssh_opts -i $SSH_KEY"
+                ssh $ssh_opts "$SSH_USER@$POWERBEAM_IP"
+                ;;
+            22)
+                read -p "Reboot PowerBeam? (y/N): " confirm
+                if [[ $confirm =~ ^[Yy]$ ]]; then
+                    ssh_cmd "reboot" && success "Reboot command sent — device will be back in ~60s"
+                fi
+                ;;
+            23)
+                read -p "Enter new IP address: " new_ip
+                if validate_ip "$new_ip"; then
+                    POWERBEAM_IP="$new_ip"
+                    log "Target IP changed to $POWERBEAM_IP"
+                    if check_connection 2>/dev/null; then
+                        success "Now connected to $POWERBEAM_IP"
+                    else
+                        warning "Still cannot connect to $POWERBEAM_IP"
+                    fi
+                else
+                    error "Invalid IP address"
+                fi
+                ;;
+            0)
+                log "Goodbye!"
+                exit 0
+                ;;
+            *)
+                error "Invalid option"
+                ;;
+        esac
+
+        echo ""
+        read -p "Press Enter to continue..."
+    done
+}
+
+# Run
+main "$@"
